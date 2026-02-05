@@ -202,6 +202,41 @@
 
 ---
 
+#### 5. task_metrics - 任务指标（Token消耗）
+
+```json
+{
+  "type": "task_metrics",
+  "session_id": "session_xxx",
+  "current_step": 5,
+  "total_steps": 12,
+  "current_cost": 0.03,
+  "total_tokens": 7500,
+  "input_tokens": 6500,
+  "output_tokens": 1000,
+  "model": "gpt-4o-mini"
+}
+```
+
+**说明**: 
+- 每步AI决策后下发，实时同步消耗情况
+- 悬浮窗显示 `current_cost`
+- 任务结束后可累计统计
+
+**字段说明**:
+
+| 字段 | 类型 | 说明 |
+|------|------|------|
+| `current_step` | number | 当前步骤数 |
+| `total_steps` | number | 预估总步骤数（可选） |
+| `current_cost` | number | 当前任务累计成本（美元） |
+| `total_tokens` | number | 累计Token数 |
+| `input_tokens` | number | Input Token数 |
+| `output_tokens` | number | Output Token数 |
+| `model` | string | 使用的模型 |
+
+---
+
 ## 状态机
 
 ### 任务状态
