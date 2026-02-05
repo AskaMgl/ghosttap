@@ -44,13 +44,6 @@ AI 驱动的 Android 远程控制。让 AI 成为你的手机替身。
 帮我回复微信消息
 ```
 
-## 📖 文档
-
-- [架构设计](docs/architecture.md)
-- [通信协议](docs/protocol.md)
-- [安全说明](docs/security.md)
-- [自部署指南](docs/self-hosting.md)
-
 ## 🏗️ 架构
 
 ```
@@ -74,6 +67,17 @@ AI 驱动的 Android 远程控制。让 AI 成为你的手机替身。
 └─────────────────────────────────────┘
 ```
 
+## 📁 项目结构
+
+```
+ghosttap/
+├── apps/
+│   ├── android/     # Android 客户端
+│   └── server/      # Node.js 服务端
+└── packages/
+    └── protocol/    # 通信协议定义
+```
+
 ## 🔧 自部署
 
 ```bash
@@ -91,24 +95,13 @@ cd ../android
 ./gradlew assembleDebug
 ```
 
-详细指南：[自部署文档](docs/self-hosting.md)
-
 ## 🤝 贡献
 
 欢迎 PR 和 Issue！
 
-- [贡献指南](CONTRIBUTING.md)
-- [开发文档](docs/development.md)
-- [行为准则](CODE_OF_CONDUCT.md)
-
 ## 📄 许可
 
 MIT License - 详见 [LICENSE](LICENSE)
-
-## 🙏 致谢
-
-- [OpenClaw](https://github.com/openclaw/openclaw) - AI 助手框架
-- [Android Accessibility](https://developer.android.com/guide/topics/ui/accessibility) - Android 无障碍服务
 
 ---
 
