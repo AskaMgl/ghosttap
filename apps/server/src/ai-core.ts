@@ -1,4 +1,4 @@
-import { UiEventMessage, AiDecision, ActionCommandMessage, TaskSession } from './types';
+import { UiEventMessage, AiDecision, ActionCommandMessage, SessionContext } from './types';
 import { config } from './config';
 import { logger } from './logger';
 import { UiFormatter } from './formatter';
@@ -8,11 +8,12 @@ import { UiFormatter } from './formatter';
  * 
  * 职责：根据当前UI状态和任务目标，选择最合适的下一个动作
  * 
- * 改进点：
- * - 添加了完整的重试机制（指数退避）
- * - 细化了错误分类和处理
- * - 添加了网络错误检测
- * - 增加了重试日志
+ * v3.12 更新:
+ * - 更新 System Prompt：移除 expect，更新敏感操作检测规则，添加软键盘处理规则
+ * - 移除 element_id 相关逻辑
+ * - 新增 home() 和 launch_app(package_name) 动作
+ * - swipe 动作支持可选的 target.center、distance、duration_ms 参数
+ * - 决策输出不再包含 expect 和 element_id
  */
 export class AiCore {
   private systemPrompt: string;
@@ -25,6 +26,7 @@ export class AiCore {
 
   /**
    * 构建系统Prompt
+   * v3.12: 移除 expect，更新敏感操作检测规则，添加软键盘处理规则
    */
   private buildSystemPrompt(): string {
     return `你是一个手机自动化助手，负责控制用户的Android手机完成指定任务。
@@ -36,6 +38,7 @@ export class AiCore {
 
 ## 输入格式
 屏幕: {width}x{height} ({package})
+键盘: 可见, 占屏幕 {height}%（y > {threshold}% 的区域被遮挡）
 
 [element_id] type "text" @ (x%, y%) [available_actions]
 ...
@@ -48,73 +51,94 @@ export class AiCore {
 - [{timestamp}] {action} ({reason})
 
 ## 输出格式
-必须返回有效的JSON，格式如下:
+必须返回有效的JSON:
 {
   "thought": "你的分析过程，包括当前界面状态、目标进度、下一步计划",
   "action": "动作名称",
-  "target": {
-    "element_id": 元素ID,
+  "target": {                         // click/input 动作时必填
     "center": [x百分比, y百分比]
   },
-  "text": "输入文本（input动作时）",
-  "reason": "选择这个动作的原因",
-  "expect": "执行后预期会发生什么"
+  "text": "输入文本",                  // input 动作时必填
+  "direction": "up/down/left/right",  // swipe 动作时必填
+  "distance": 30,                     // swipe 距离百分比（可选，默认30）
+  "duration_ms": 300,                 // swipe 时长毫秒（可选，默认300）
+  "package_name": "com.example.app",  // launch_app 动作时必填
+  "wait_ms": 1000,                    // wait 动作时必填（毫秒）
+  "reason": "选择这个动作的原因"
 }
 
 ## 可用动作
-- click: 点击指定元素
-- input: 在指定输入框输入文字（需同时提供text字段）
-- swipe: 滑动屏幕（需同时提供direction字段: up/down/left/right）
+- click: 点击指定位置（需要target.center）
+- input: 在指定位置输入文字（需要target + text）
+- swipe: 滑动屏幕（需要direction: up/down/left/right；可选 target.center 指定起点百分比坐标，默认屏幕中心；可选 distance 指定滑动距离百分比，默认30；可选 duration_ms 指定滑动时长毫秒，默认300）
 - back: 返回上一级
-- wait: 等待指定毫秒（用于等待页面加载）
-- pause: 暂停任务，请求人工接管（敏感操作）
-- done: 任务完成
-- fail: 任务无法完成
+- home: 回到桌面（映射 GLOBAL_ACTION_HOME）
+- launch_app: 启动指定APP（需要package_name，如"com.taobao.taobao"；无需先回桌面，可直接从任意界面拉起目标APP）
+- wait: 等待指定毫秒后重新获取UI（需要wait_ms）
+- pause: 暂停任务，请求人工接管
+- done: 任务完成（需要reason说明结果）
+- fail: 任务无法完成（需要reason说明原因）
+
+> done/fail 是终止指令，输出后任务立即结束，不会再收到新的UI。
 
 ## 规则
 1. 所有坐标使用百分比 [0-100, 0-100]
-2. 输入文字前必须先点击对应输入框
-3. 找不到目标时尝试滑动查找或返回
-4. 连续3次无进展时放弃并报错
-5. 遇到弹窗优先处理弹窗
+2. input 动作会自动聚焦目标输入框，无需先单独 click
+3. **手机端执行完全依赖 center 坐标定位，务必确保 center 坐标准确**
+4. 找不到目标时尝试滑动或返回
+5. 连续3次UI无实质变化且输出相同动作时，输出 fail("操作无进展")
+6. 遇到弹窗优先处理弹窗
+7. **软键盘处理**：当键盘可见时，屏幕底部 keyboard_height% 区域被键盘遮挡。如果目标元素的 y 坐标落在被遮挡区域内（y% > 100 - keyboard_height%），应先执行 back() 收起键盘，再操作目标元素
 
 ## 页面加载等待策略
-当界面显示以下状态时，必须输出wait而非立即执行：
+当界面显示以下状态时，必须等待而非立即执行：
 - "加载中"、"正在加载"等文字提示
 - 转圈动画、骨架屏
 - 元素明显不全（如只有标题栏，内容区空白）
 - 网络请求提示
 
-正确做法：
+**正确做法**：
 \`\`\`json
 {
   "thought": "页面显示'加载中'转圈，内容尚未加载完成",
   "action": "wait",
-  "params": {"ms": 1000},
-  "reason": "等待页面加载完成",
-  "expect": "1秒后收到新的UI事件，显示完整页面内容"
+  "wait_ms": 1000,
+  "reason": "等待页面加载完成"
 }
 \`\`\`
 
-## 敏感操作检测（关键！）
-**当界面出现以下情况时，必须输出pause()：**
-1. 包含"支付"、"密码"、"确认付款"等敏感词
-2. 涉及金额输入或确认（包含"¥"或"元"且涉及交易）
-3. 其他需要用户亲自确认的操作
+## ⚠️ 敏感操作检测（第二层：AI 软检测）
+> 注意：系统已有第一层硬编码关键词检测（"支付"、"密码"等），会在你被调用之前自动拦截。
+> 你的职责是覆盖第一层无法捕获的**变体表述和上下文敏感场景**。
 
-**示例：**
-界面出现'确认支付¥99.00'按钮 → 输出pause，reason写"检测到支付确认，需要用户亲自确认"
-界面出现'请输入支付密码'输入框 → 输出pause，reason写"涉及支付密码，需要用户亲自操作"
+当界面出现以下情况时，必须输出 pause：
+1. 涉及资金操作（转账、充值、购买确认等）
+2. 涉及身份验证（人脸识别、短信验证码确认等）
+3. 涉及不可逆操作（删除账号、解除绑定等）
+4. 其他需要用户亲自确认的操作
 
-## 坐标使用
-- 直接使用元素提供的百分比坐标
-- 不要凭空猜测坐标，必须使用界面中存在的元素坐标`;
+**示例**：
+\`\`\`json
+{
+  "thought": "界面出现'确认转账给张三 ¥500.00'，涉及资金操作",
+  "action": "pause",
+  "reason": "检测到转账确认，需要用户亲自确认"
+}
+\`\`\`
+
+## WebView 快速失败
+AI 看到单一 WebView 节点且无子元素时，直接输出 fail("当前页面为 WebView，无法采集内容")，快速失败优于无效盲点尝试。
+
+## 已知限制：系统弹窗与覆盖层
+- 权限弹窗（package 变为 com.android.packageinstaller 等）：根据任务需要选择"允许"或"拒绝"
+- 来电覆盖（package 变为电话 APP）：输出 wait，等待用户处理完来电
+- 通知面板（package 变为 com.android.systemui）：输出 back() 收起通知面板`;
   }
 
   /**
    * 构建用户Prompt
    */
-  private buildUserPrompt(session: TaskSession, uiEvent: UiEventMessage): string {
+  private buildUserPrompt(session: SessionContext, uiEvent: UiEventMessage): string {
     const uiText = UiFormatter.formatForAi(uiEvent);
     const historyText = UiFormatter.formatHistory(session.history);
     
@@ -201,10 +225,11 @@ ${historyText}`;
 
   /**
    * 调用AI模型进行决策（带重试机制）
+   * v3.12: 第一层敏感词检测在调用前由 WebSocketGateway 执行
    * 返回：决策 + 实际Token消耗
    */
   async decide(
-    session: TaskSession, 
+    session: SessionContext, 
     uiEvent: UiEventMessage
   ): Promise<{ decision: AiDecision; inputTokens: number; outputTokens: number }> {
     const userPrompt = this.buildUserPrompt(session, uiEvent);
@@ -220,39 +245,41 @@ ${historyText}`;
       const loadingCheck = UiFormatter.isLoadingState(uiEvent);
       if (loadingCheck.isLoading) {
         logger.info('Page loading detected, auto-wait', { reason: loadingCheck.reason });
-        // 重置重试计数（因为这是预期行为，不是错误）
         this.resetRetryCount(session.session_id);
         return {
           decision: {
             thought: `页面正在加载: ${loadingCheck.reason}`,
             action: 'wait',
+            wait_ms: 1000,
             reason: '等待页面加载完成',
-            expect: '1秒后页面加载完成',
-            params: { ms: 1000 },
           },
           inputTokens: 0,
           outputTokens: 0,
         };
       }
 
-      // 检查敏感操作
+      // v3.12: 第二层敏感操作检测（AI软检测）
+      // 第一层硬检测由 WebSocketGateway 在调用 decide 之前执行
       const sensitiveCheck = UiFormatter.detectSensitiveOperations(uiEvent);
       if (sensitiveCheck.isSensitive) {
-        logger.info('Sensitive operation detected, requesting pause', { 
-          reason: sensitiveCheck.reason 
-        });
-        // 重置重试计数
-        this.resetRetryCount(session.session_id);
-        return {
-          decision: {
-            thought: `检测到敏感操作: ${sensitiveCheck.reason}。根据安全规则，需要用户亲自确认。`,
-            action: 'pause',
-            reason: sensitiveCheck.reason!,
-            expect: '用户手动完成操作后点击继续',
-          },
-          inputTokens: 0,
-          outputTokens: 0,
-        };
+        // 检查是否是第一层已经拦截过的（通过reason判断）
+        const isFirstLayer = sensitiveCheck.reason?.includes('检测到敏感操作:') ||
+                            sensitiveCheck.reason?.includes('检测到支付金额:');
+        if (!isFirstLayer) {
+          logger.info('Sensitive operation detected by AI (second layer)', { 
+            reason: sensitiveCheck.reason 
+          });
+          this.resetRetryCount(session.session_id);
+          return {
+            decision: {
+              thought: `检测到敏感操作: ${sensitiveCheck.reason}。根据安全规则，需要用户亲自确认。`,
+              action: 'pause',
+              reason: sensitiveCheck.reason!,
+            },
+            inputTokens: 0,
+            outputTokens: 0,
+          };
+        }
       }
 
       // 调用LLM API（带重试）
@@ -268,7 +295,6 @@ ${historyText}`;
       logger.debug('AI decision', { 
         session_id: session.session_id,
         action: result.decision.action,
-        target_id: result.decision.target?.element_id,
         inputTokens: result.inputTokens,
         outputTokens: result.outputTokens
       });
@@ -292,9 +318,8 @@ ${historyText}`;
         decision: {
           thought: `AI决策出错（已重试${currentRetry}次）: ${err.message}。等待后重试。`,
           action: 'wait',
+          wait_ms: 3000,
           reason: 'AI服务暂时不可用，等待重试',
-          expect: '等待后系统会自动重试',
-          params: { ms: 3000 },
         },
         inputTokens: 0,
         outputTokens: 0,
@@ -470,6 +495,7 @@ ${historyText}`;
 
   /**
    * 解析AI返回的决策
+   * v3.12: 移除 expect 和 element_id 解析
    */
   private parseDecision(content: string): AiDecision {
     try {
@@ -481,15 +507,40 @@ ${historyText}`;
       
       const parsed = JSON.parse(content);
       
-      return {
+      const decision: AiDecision = {
         thought: parsed.thought || '',
         action: parsed.action || 'wait',
-        target: parsed.target,
-        text: parsed.text,
         reason: parsed.reason || 'AI决策',
-        expect: parsed.expect || '',
-        params: parsed.params,
       };
+
+      // v3.12: 只解析 center 坐标，不解析 element_id
+      if (parsed.target?.center) {
+        decision.target = {
+          center: parsed.target.center,
+        };
+      }
+
+      // 可选参数
+      if (parsed.text) {
+        decision.text = parsed.text;
+      }
+      if (parsed.direction) {
+        decision.direction = parsed.direction;
+      }
+      if (parsed.distance !== undefined) {
+        decision.distance = parsed.distance;
+      }
+      if (parsed.duration_ms !== undefined) {
+        decision.duration_ms = parsed.duration_ms;
+      }
+      if (parsed.package_name) {
+        decision.package_name = parsed.package_name;
+      }
+      if (parsed.wait_ms !== undefined) {
+        decision.wait_ms = parsed.wait_ms;
+      }
+
+      return decision;
     } catch (error) {
       logger.error('Failed to parse AI decision', error, { content });
       throw new Error('Invalid AI response format');
@@ -498,18 +549,18 @@ ${historyText}`;
 
   /**
    * 将AI决策转换为动作指令
+   * v3.12: 移除 expect 和 element_id，支持新的动作参数
    */
   decisionToCommand(decision: AiDecision): ActionCommandMessage {
     const command: ActionCommandMessage = {
       type: 'action',
       action: decision.action as ActionCommandMessage['action'],
       reason: decision.reason,
-      expect: decision.expect,
     };
 
-    if (decision.target) {
+    // v3.12: 只传递 center，不传递 element_id
+    if (decision.target?.center) {
       command.target = {
-        element_id: decision.target.element_id,
         center: decision.target.center,
       };
     }
@@ -518,12 +569,24 @@ ${historyText}`;
       command.text = decision.text;
     }
 
-    if (decision.params?.direction) {
-      command.direction = decision.params.direction;
+    if (decision.direction) {
+      command.direction = decision.direction;
     }
 
-    if (decision.params?.ms) {
-      command.ms = decision.params.ms;
+    if (decision.distance !== undefined) {
+      command.distance = decision.distance;
+    }
+
+    if (decision.duration_ms !== undefined) {
+      command.duration_ms = decision.duration_ms;
+    }
+
+    if (decision.package_name) {
+      command.package_name = decision.package_name;
+    }
+
+    if (decision.wait_ms !== undefined) {
+      command.wait_ms = decision.wait_ms;
     }
 
     return command;

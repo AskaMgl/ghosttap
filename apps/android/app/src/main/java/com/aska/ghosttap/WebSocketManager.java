@@ -17,28 +17,38 @@ import okhttp3.WebSocketListener;
 import okhttp3.logging.HttpLoggingInterceptor;
 
 /**
- * WebSocket 连接管理器
+ * WebSocket 连接管理器 (v3.12)
  * 
  * 职责：
- * 1. 建立和维护 WebSocket 连接
- * 2. 发送心跳保活
- * 3. 自动重连（指数退避）
+ * 1. 通过 URL query 参数进行连接认证
+ * 2. 发送心跳保活（90秒间隔）
+ * 3. 自动重连（指数退避，while循环避免栈溢出）
  * 4. 消息序列化和反序列化
  */
 public class WebSocketManager {
     
     private static final String TAG = Config.LOG_TAG + ".WebSocket";
     
+    // v3.12: 心跳配置
+    private static final long HEARTBEAT_INTERVAL_MS = 90 * 1000L;  // 90秒
+    private static final long PONG_TIMEOUT_MS = 5 * 1000L;         // 5秒等待pong
+    private static final long MAX_RETRY_DELAY_MS = 60 * 1000L;     // 最大60秒
+    
     private final OkHttpClient client;
     private final Handler handler;
     
     private WebSocket webSocket;
     private String userId = "";
+    private String deviceName = "";
     private boolean isConnected = false;
-    private int reconnectAttempt = 0;
+    private volatile boolean shouldReconnect = true;
     
-    private Runnable heartbeatRunnable;
-    private Runnable reconnectRunnable;
+    // v3.12: 心跳状态跟踪
+    private volatile long lastPingSentTime = 0L;   // 最近一次 ping 发送时间
+    private volatile long lastPongTime = 0L;       // 最近一次 pong 接收时间
+    private long retryDelay = 1000L;
+    
+    private Thread reconnectThread;
     
     private final OnConnectedCallback onConnected;
     private final OnDisconnectedCallback onDisconnected;
@@ -66,9 +76,9 @@ public class WebSocketManager {
         this.onMessage = onMessage;
         
         OkHttpClient.Builder builder = new OkHttpClient.Builder()
-            .pingInterval(Config.HEARTBEAT_INTERVAL, TimeUnit.MILLISECONDS)
             .connectTimeout(10, TimeUnit.SECONDS)
-            .readTimeout(0, TimeUnit.SECONDS); // WebSocket 需要无限读取超时
+            .readTimeout(0, TimeUnit.SECONDS) // WebSocket 需要无限读取超时
+            .writeTimeout(10, TimeUnit.SECONDS);
         
         if (Config.DEBUG_MODE) {
             HttpLoggingInterceptor logging = new HttpLoggingInterceptor();
@@ -81,18 +91,24 @@ public class WebSocketManager {
     }
     
     /**
-     * 连接到 WebSocket 服务器
+     * 连接到 WebSocket 服务器 (v3.12: URL query 参数认证)
      */
-    public void connect(String userId) {
+    public void connect(String userId, String deviceName) {
         this.userId = userId;
+        this.deviceName = deviceName != null ? deviceName : "Android设备";
         
         if (isConnected) {
             Log.w(TAG, "Already connected");
             return;
         }
         
+        shouldReconnect = true;
+        
+        // v3.12: 通过 URL query 参数传递认证信息
+        String wsUrl = Config.SERVER_URL + "?user_id=" + userId + "&device_name=" + deviceName;
+        
         Request request = new Request.Builder()
-            .url(Config.SERVER_URL)
+            .url(wsUrl)
             .build();
         
         webSocket = client.newWebSocket(request, new WebSocketListener() {
@@ -100,12 +116,9 @@ public class WebSocketManager {
             public void onOpen(WebSocket webSocket, Response response) {
                 Log.i(TAG, "WebSocket connected");
                 isConnected = true;
-                reconnectAttempt = 0;
+                retryDelay = 1000L;  // 重置重连延迟
                 
-                // 发送初始 ping 进行认证
-                sendPing();
-                
-                // 启动心跳
+                // v3.12: 启动心跳（不再发送初始ping认证，等服务器发送pong）
                 startHeartbeat();
                 
                 if (onConnected != null) {
@@ -142,11 +155,19 @@ public class WebSocketManager {
     }
     
     /**
+     * 重载：使用默认设备名称
+     */
+    public void connect(String userId) {
+        connect(userId, Config.DEVICE_NAME);
+    }
+    
+    /**
      * 断开连接
      */
     public void disconnect() {
         Log.i(TAG, "Disconnecting...");
         
+        shouldReconnect = false;
         stopHeartbeat();
         cancelReconnect();
         
@@ -157,7 +178,7 @@ public class WebSocketManager {
         
         isConnected = false;
         if (onDisconnected != null) {
-            onDisconnected.onDisconnected();
+            handler.post(onDisconnected::onDisconnected);
         }
     }
     
@@ -172,31 +193,42 @@ public class WebSocketManager {
     }
     
     /**
-     * 发送授权响应
+     * 发送暂停请求 (v3.12: 新增)
      */
-    public void sendAuthorization(String sessionId, String decision) {
+    public void sendPauseRequest(String sessionId) {
         if (!isConnected) return;
         
-        AuthorizationMessage message = new AuthorizationMessage(
-            userId,
-            sessionId,
-            decision
-        );
-        
+        PauseRequest message = new PauseRequest(sessionId);
         send(JsonUtils.toJson(message));
     }
     
     /**
-     * 发送恢复任务消息
+     * 发送恢复请求 (v3.12: 新增)
      */
-    public void sendResume(String sessionId) {
+    public void sendResumeRequest(String sessionId) {
         if (!isConnected) return;
         
-        ResumeMessage message = new ResumeMessage(
-            userId,
-            sessionId
-        );
+        ResumeRequest message = new ResumeRequest(sessionId);
+        send(JsonUtils.toJson(message));
+    }
+    
+    /**
+     * 发送停止请求 (v3.12: 新增)
+     */
+    public void sendStopRequest(String sessionId) {
+        if (!isConnected) return;
         
+        StopRequest message = new StopRequest(sessionId);
+        send(JsonUtils.toJson(message));
+    }
+    
+    /**
+     * 发送错误事件 (v3.12: 新增)
+     */
+    public void sendErrorEvent(String sessionId, String errorCode, String errorMessage) {
+        if (!isConnected) return;
+        
+        ErrorEvent message = new ErrorEvent(sessionId, errorCode, errorMessage);
         send(JsonUtils.toJson(message));
     }
     
@@ -214,97 +246,117 @@ public class WebSocketManager {
     }
     
     /**
-     * 发送心跳
+     * v3.12: 发送心跳（90秒间隔）
      */
     private void sendPing() {
-        PingMessage ping = new PingMessage(
-            userId,
-            System.currentTimeMillis()
-        );
+        if (!isConnected) return;
+        
+        lastPingSentTime = System.currentTimeMillis();
+        PingMessage ping = new PingMessage(lastPingSentTime);
         
         send(JsonUtils.toJson(ping));
+        
+        // 5秒后检查是否收到pong
+        handler.postDelayed(() -> {
+            if (isConnected && lastPongTime < lastPingSentTime) {
+                Log.w(TAG, "Pong timeout, closing connection");
+                // 未收到pong，关闭连接触发重连
+                if (webSocket != null) {
+                    webSocket.close(1001, "Pong timeout");
+                }
+            }
+        }, PONG_TIMEOUT_MS);
     }
     
     /**
-     * 启动心跳定时器
+     * v3.12: 启动心跳定时器（90秒间隔）
      */
     private void startHeartbeat() {
-        heartbeatRunnable = new Runnable() {
+        // 立即发送第一个ping
+        sendPing();
+        
+        // 定时发送后续ping
+        Runnable heartbeatRunnable = new Runnable() {
             @Override
             public void run() {
                 if (isConnected) {
                     sendPing();
-                    handler.postDelayed(this, Config.HEARTBEAT_INTERVAL);
+                    handler.postDelayed(this, HEARTBEAT_INTERVAL_MS);
                 }
             }
         };
         
-        handler.postDelayed(heartbeatRunnable, Config.HEARTBEAT_INTERVAL);
+        handler.postDelayed(heartbeatRunnable, HEARTBEAT_INTERVAL_MS);
     }
     
     /**
      * 停止心跳
      */
     private void stopHeartbeat() {
-        if (heartbeatRunnable != null) {
-            handler.removeCallbacks(heartbeatRunnable);
-            heartbeatRunnable = null;
-        }
+        // 移除所有待执行的runnable
+        handler.removeCallbacksAndMessages(null);
     }
     
     /**
      * 处理连接断开
      */
     private void handleDisconnect() {
-        if (!isConnected) return;
+        if (!isConnected && !shouldReconnect) return;
         
         isConnected = false;
         if (onDisconnected != null) {
-            onDisconnected.onDisconnected();
+            handler.post(onDisconnected::onDisconnected);
         }
         
         // 尝试重连
-        scheduleReconnect();
+        if (shouldReconnect) {
+            scheduleReconnect();
+        }
     }
     
     /**
-     * 调度重连
+     * v3.12: 调度重连（while循环避免栈溢出）
      */
     private void scheduleReconnect() {
-        if (reconnectRunnable != null) return;
+        if (reconnectThread != null && reconnectThread.isAlive()) {
+            return;  // 已有重连线程在运行
+        }
         
-        // 计算重连延迟（指数退避）
-        long delay = Math.min(
-            Config.RECONNECT_BASE_DELAY * (1L << reconnectAttempt),
-            Config.RECONNECT_MAX_DELAY
-        );
-        
-        Log.i(TAG, "Reconnecting in " + delay + "ms (attempt " + reconnectAttempt + ")");
-        
-        reconnectRunnable = new Runnable() {
-            @Override
-            public void run() {
-                reconnectRunnable = null;
-                reconnectAttempt++;
-                connect(userId);
+        reconnectThread = new Thread(() -> {
+            while (shouldReconnect && !isConnected) {
+                try {
+                    Log.i(TAG, "Reconnecting in " + retryDelay + "ms");
+                    Thread.sleep(retryDelay);
+                    
+                    // 指数退避
+                    retryDelay = Math.min(retryDelay * 2, MAX_RETRY_DELAY_MS);
+                    
+                    if (shouldReconnect && !isConnected) {
+                        handler.post(() -> connect(userId, deviceName));
+                        return;  // connect会创建新的WebSocket，退出循环
+                    }
+                } catch (InterruptedException e) {
+                    Log.d(TAG, "Reconnect thread interrupted");
+                    return;
+                }
             }
-        };
+        });
         
-        handler.postDelayed(reconnectRunnable, delay);
+        reconnectThread.start();
     }
     
     /**
      * 取消重连
      */
     private void cancelReconnect() {
-        if (reconnectRunnable != null) {
-            handler.removeCallbacks(reconnectRunnable);
-            reconnectRunnable = null;
+        if (reconnectThread != null) {
+            reconnectThread.interrupt();
+            reconnectThread = null;
         }
     }
     
     /**
-     * 处理收到的消息
+     * v3.12: 处理收到的消息（更新消息类型）
      */
     private void handleMessage(String text) {
         try {
@@ -315,19 +367,28 @@ public class WebSocketManager {
             switch (type) {
                 case "pong":
                     message = JsonUtils.fromJson(text, PongMessage.class);
+                    // v3.12: 更新pong时间
+                    if (message instanceof PongMessage) {
+                        lastPongTime = System.currentTimeMillis();
+                    }
                     break;
-                case "request_control":
-                    message = JsonUtils.fromJson(text, ControlRequestMessage.class);
+                    
+                case "task_start":
+                    message = JsonUtils.fromJson(text, TaskStart.class);
                     break;
+                    
+                case "task_resume":
+                    message = JsonUtils.fromJson(text, TaskResume.class);
+                    break;
+                    
                 case "action":
                     message = JsonUtils.fromJson(text, ActionCommandMessage.class);
                     break;
+                    
                 case "task_end":
-                    message = JsonUtils.fromJson(text, TaskEndMessage.class);
+                    message = JsonUtils.fromJson(text, TaskEnd.class);
                     break;
-                case "task_metrics":
-                    message = JsonUtils.fromJson(text, TaskMetricsMessage.class);
-                    break;
+                    
                 default:
                     Log.w(TAG, "Unknown message type: " + type);
                     return;

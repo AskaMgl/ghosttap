@@ -9,9 +9,9 @@ export interface ServerConfig {
   port: number;
   host: string;
   
-  // WebSocket
-  heartbeatInterval: number;  // 心跳检测间隔 (ms)
-  heartbeatTimeout: number;   // 心跳超时时间 (ms)
+  // WebSocket - v3.12: 心跳间隔改为90秒
+  heartbeatInterval: number;  // 心跳检测间隔 (ms) - 90秒
+  heartbeatTimeout: number;   // 心跳超时时间 (ms) - 3分钟（2个心跳周期）
   maxReconnectDelay: number;  // 最大重连延迟 (ms)
   
   // AI
@@ -27,16 +27,14 @@ export interface ServerConfig {
   aiRetryMaxDelay: number;
   aiRetryBackoffMultiplier: number;
   
-  // Task
-  authTimeout: number;        // 授权超时时间 (ms)
-  taskTimeout: number;        // 任务超时时间 (ms)
-  pauseTimeout: number;       // 暂停超时时间 (ms)
+  // Task - v3.12: 移除 authTimeout（不再需要授权等待）
+  taskTimeout: number;        // 任务超时时间 (ms) - 30分钟
+  pauseTimeout: number;       // 暂停超时时间 (ms) - 5分钟
   maxSteps: number;           // 最大步骤数
+  disconnectGrace: number;    // 断连宽限期 (ms) - 30秒
   
-  // Feishu Notification
+  // Feishu Notification (可选，向后兼容)
   feishuWebhook?: string;     // Feishu 机器人 Webhook
-  feishuAppId?: string;       // Feishu App ID (可选)
-  feishuAppSecret?: string;   // Feishu App Secret (可选)
   
   // Storage
   dbPath: string;             // SQLite 数据库路径
@@ -70,9 +68,9 @@ export const config: ServerConfig = {
   port: getEnvNumber('PORT', 8080),
   host: getEnv('HOST', '0.0.0.0'),
   
-  // WebSocket - 根据设计文档：3分钟心跳
-  heartbeatInterval: getEnvNumber('WS_HEARTBEAT_INTERVAL', 3 * 60 * 1000), // 3分钟
-  heartbeatTimeout: getEnvNumber('WS_HEARTBEAT_TIMEOUT', 10 * 60 * 1000),   // 10分钟超时
+  // WebSocket - v3.12: 心跳间隔90秒（适配NAT超时低至60-120秒的运营商）
+  heartbeatInterval: getEnvNumber('WS_HEARTBEAT_INTERVAL', 90 * 1000), // 90秒
+  heartbeatTimeout: getEnvNumber('WS_HEARTBEAT_TIMEOUT', 3 * 60 * 1000),   // 3分钟超时（2个心跳周期）
   maxReconnectDelay: getEnvNumber('WS_MAX_RECONNECT_DELAY', 60 * 1000),     // 60秒最大重连
   
   // AI - 使用用户当前的模型 kimi-coding/k2p5
@@ -88,16 +86,14 @@ export const config: ServerConfig = {
   aiRetryMaxDelay: getEnvNumber('AI_RETRY_MAX_DELAY', 10000),
   aiRetryBackoffMultiplier: getEnvNumber('AI_RETRY_BACKOFF_MULTIPLIER', 2),
   
-  // Task - 根据设计文档
-  authTimeout: getEnvNumber('AUTH_TIMEOUT', 60 * 1000),      // 60秒授权超时
+  // Task - v3.12: 移除 authTimeout，任务创建后直接 running
   taskTimeout: getEnvNumber('TASK_TIMEOUT', 30 * 60 * 1000), // 30分钟任务超时
   pauseTimeout: getEnvNumber('PAUSE_TIMEOUT', 5 * 60 * 1000), // 5分钟暂停超时
   maxSteps: getEnvNumber('MAX_STEPS', 50),                   // 最大50步
+  disconnectGrace: getEnvNumber('DISCONNECT_GRACE', 30 * 1000), // 30秒断连宽限期
   
-  // Feishu Notification
+  // Feishu Notification (可选，向后兼容)
   feishuWebhook: process.env.FEISHU_WEBHOOK,
-  feishuAppId: process.env.FEISHU_APP_ID,
-  feishuAppSecret: process.env.FEISHU_APP_SECRET,
   
   // Storage
   dbPath: getEnv('DB_PATH', './data/ghosttap.db'),
@@ -116,7 +112,6 @@ export function validateConfig(): void {
   console.log(`  - Port: ${config.port}`);
   console.log(`  - AI Model: ${config.aiModel}`);
   console.log(`  - AI Retry: ${config.aiRetryMaxAttempts} attempts`);
-  console.log(`  - Heartbeat Interval: ${config.heartbeatInterval}ms`);
+  console.log(`  - Heartbeat Interval: ${config.heartbeatInterval}ms (90s)`);
   console.log(`  - DB Path: ${config.dbPath}`);
-  console.log(`  - Feishu Webhook: ${config.feishuWebhook ? 'Configured' : 'Not configured'}`);
 }

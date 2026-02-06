@@ -1,0 +1,13 @@
+    /**
+     * 停止当前任务（供外部调用）
+     */
+    public void stopCurrentTask() {
+        if (currentSessionId != null) {
+            // 发送停止请求到云端
+            if (webSocketManager != null) {
+                webSocketManager.sendStopRequest(currentSessionId);
+            }
+            // 结束本地任务
+            endTask("cancelled", "用户停止服务");
+        }
+    }

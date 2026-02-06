@@ -2,34 +2,43 @@ package com.aska.ghosttap;
 
 import android.accessibilityservice.AccessibilityService;
 import android.accessibilityservice.AccessibilityServiceInfo;
-import android.content.Intent;
+import android.app.Notification;
+import android.app.NotificationChannel;
+import android.app.NotificationManager;
 import android.content.SharedPreferences;
+import android.graphics.Point;
+import android.os.Build;
 import android.os.Handler;
 import android.os.Looper;
 import android.provider.Settings;
 import android.util.Log;
+import android.view.Display;
+import android.view.WindowManager;
 import android.view.accessibility.AccessibilityEvent;
 import android.view.accessibility.AccessibilityNodeInfo;
 
 import java.util.UUID;
 
 /**
- * GhostTap 无障碍服务核心
+ * GhostTap 无障碍服务核心 (v3.12)
  * 
  * 职责：
  * - 作为 AccessibilityService 接收系统 UI 事件
  * - 管理 WebSocket 连接
  * - 协调 UI 采集、指令执行、悬浮窗显示
- * - 处理任务生命周期（授权、执行、暂停、结束）
+ * - 处理任务生命周期（v3.12: 移除授权流程，任务创建后直接开始）
  */
 public class GhostTapService extends AccessibilityService implements
         WebSocketManager.OnConnectedCallback,
         WebSocketManager.OnDisconnectedCallback,
         WebSocketManager.OnMessageCallback,
-        FloatWindowManager.AuthCallback,
         FloatWindowManager.PauseCallback {
     
     private static final String TAG = Config.LOG_TAG + ".Service";
+    
+    // v3.12: ForegroundService 通知
+    private static final String NOTIFICATION_CHANNEL_ID = "ghosttap_channel";
+    private static final int NOTIFICATION_ID = 1;
     
     // 服务运行状态
     private static volatile boolean isRunning = false;
@@ -46,35 +55,77 @@ public class GhostTapService extends AccessibilityService implements
     // 主线程 Handler
     private final Handler mainHandler = new Handler(Looper.getMainLooper());
     
-    // 任务状态
+    // v3.12: 任务状态
     private String currentSessionId;
     private String currentGoal;
     private TaskStatus taskStatus = TaskStatus.IDLE;
-    private boolean isPaused = false;
+    private boolean isUiReporting = false;  // 是否正在上报 UI
     
     // UI 变化节流
     private long lastUiEventTime = 0;
     private final Handler uiEventHandler = new Handler(Looper.getMainLooper());
     private Runnable pendingUiEvent;
     
-    // 当前步骤和花费
-    private int currentStep = 0;
-    private double currentCost = 0.0;
-    
-    // 屏幕尺寸（简化处理，实际应该从 WindowManager 获取）
+    // 屏幕尺寸
     private int screenWidth = 1080;
     private int screenHeight = 2400;
     
     /**
-     * 任务状态枚举
+     * 任务状态枚举 (v3.12: 移除 PENDING_AUTH)
      */
     public enum TaskStatus {
         IDLE,           // 空闲
-        PENDING_AUTH,   // 等待用户授权
         RUNNING,        // 正在执行
         PAUSED,         // 已暂停
         COMPLETED,      // 已完成
         FAILED          // 失败
+    }
+    
+    /**
+     * v3.12: Service 创建时启动 ForegroundService
+     */
+    @Override
+    public void onCreate() {
+        super.onCreate();
+        startForegroundService();
+    }
+    
+    /**
+     * v3.12: 启动前台服务
+     */
+    private void startForegroundService() {
+        // 创建通知渠道（Android O+）
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            NotificationChannel channel = new NotificationChannel(
+                NOTIFICATION_CHANNEL_ID,
+                "GhostTap 服务",
+                NotificationManager.IMPORTANCE_LOW  // 低优先级，不发声不振动
+            );
+            channel.setDescription("GhostTap 远程控制服务运行中");
+            NotificationManager manager = getSystemService(NotificationManager.class);
+            if (manager != null) {
+                manager.createNotificationChannel(channel);
+            }
+        }
+        
+        // 创建通知
+        Notification.Builder builder;
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            builder = new Notification.Builder(this, NOTIFICATION_CHANNEL_ID);
+        } else {
+            builder = new Notification.Builder(this);
+        }
+        
+        Notification notification = builder
+            .setContentTitle("GhostTap 运行中")
+            .setContentText("AI 远程控制服务正在运行")
+            .setSmallIcon(android.R.drawable.ic_menu_compass)  // 使用系统图标
+            .setOngoing(true)
+            .build();
+        
+        // 启动前台服务
+        startForeground(NOTIFICATION_ID, notification);
+        Log.i(TAG, "Foreground service started");
     }
     
     /**
@@ -94,9 +145,13 @@ public class GhostTapService extends AccessibilityService implements
                           AccessibilityEvent.TYPE_VIEW_FOCUSED;
         info.feedbackType = AccessibilityServiceInfo.FEEDBACK_GENERIC;
         info.notificationTimeout = 100;
+        // v3.12: 添加 flagRetrieveInteractiveWindows 用于软键盘检测
         info.flags = AccessibilityServiceInfo.FLAG_REPORT_VIEW_IDS |
                      AccessibilityServiceInfo.FLAG_RETRIEVE_INTERACTIVE_WINDOWS;
         setServiceInfo(info);
+        
+        // 获取屏幕尺寸
+        updateScreenSize();
         
         // 初始化组件
         String userId = getUserId();
@@ -106,9 +161,10 @@ public class GhostTapService extends AccessibilityService implements
         uiCollector = new AccessibilityCollector();
         commandExecutor = new CommandExecutor(this);
         floatWindowManager = new FloatWindowManager(this);
+        floatWindowManager.setPauseCallback(this);
         
-        // 连接 WebSocket
-        webSocketManager.connect(userId);
+        // v3.12: 连接 WebSocket（传递 device_name）
+        webSocketManager.connect(userId, Config.DEVICE_NAME);
         
         // 设置实例
         instance = this;
@@ -118,11 +174,33 @@ public class GhostTapService extends AccessibilityService implements
     }
     
     /**
+     * 获取屏幕尺寸
+     */
+    private void updateScreenSize() {
+        try {
+            WindowManager wm = (WindowManager) getSystemService(WINDOW_SERVICE);
+            if (wm != null) {
+                Display display = wm.getDefaultDisplay();
+                Point size = new Point();
+                display.getRealSize(size);
+                screenWidth = size.x;
+                screenHeight = size.y;
+                Log.i(TAG, "Screen size: " + screenWidth + "x" + screenHeight);
+            }
+        } catch (Exception e) {
+            Log.w(TAG, "Failed to get screen size", e);
+        }
+    }
+    
+    /**
      * 接收无障碍事件
      */
     @Override
     public void onAccessibilityEvent(AccessibilityEvent event) {
-        if (!isRunning || currentSessionId == null || isPaused) {
+        if (!isRunning) return;
+        
+        // v3.12: 只在 RUNNING 状态且开启上报时处理
+        if (taskStatus != TaskStatus.RUNNING || !isUiReporting) {
             return;
         }
         
@@ -157,8 +235,8 @@ public class GhostTapService extends AccessibilityService implements
         isRunning = false;
         instance = null;
         
-        // 停止任务
-        if (taskStatus == TaskStatus.RUNNING) {
+        // 结束任务
+        if (taskStatus == TaskStatus.RUNNING || taskStatus == TaskStatus.PAUSED) {
             endTask("cancelled", "服务已停止");
         }
         
@@ -166,8 +244,12 @@ public class GhostTapService extends AccessibilityService implements
         if (pendingUiEvent != null) {
             uiEventHandler.removeCallbacks(pendingUiEvent);
         }
-        webSocketManager.release();
-        floatWindowManager.release();
+        if (webSocketManager != null) {
+            webSocketManager.release();
+        }
+        if (floatWindowManager != null) {
+            floatWindowManager.release();
+        }
         
         Log.i(TAG, "GhostTap service destroyed");
     }
@@ -191,226 +273,266 @@ public class GhostTapService extends AccessibilityService implements
     }
     
     /**
-     * 收到消息回调
+     * v3.12: 收到消息回调（更新消息类型处理）
      */
     @Override
     public void onMessage(ServerMessage message) {
-        if (message instanceof ControlRequestMessage) {
-            ControlRequestMessage req = (ControlRequestMessage) message;
-            handleControlRequest(req.session_id, req.goal, req.timeout_ms);
+        if (message instanceof TaskStart) {
+            TaskStart start = (TaskStart) message;
+            handleTaskStart(start.session_id, start.goal);
+        } else if (message instanceof TaskResume) {
+            TaskResume resume = (TaskResume) message;
+            handleTaskResume(resume);
         } else if (message instanceof ActionCommandMessage) {
             ActionCommandMessage cmd = (ActionCommandMessage) message;
             handleActionCommand(cmd);
-        } else if (message instanceof TaskEndMessage) {
-            TaskEndMessage end = (TaskEndMessage) message;
-            endTask(end.status, end.result);
-        } else if (message instanceof TaskMetricsMessage) {
-            TaskMetricsMessage metrics = (TaskMetricsMessage) message;
-            handleMetrics(metrics);
+        } else if (message instanceof TaskEnd) {
+            TaskEnd end = (TaskEnd) message;
+            handleTaskEnd(end.status, end.result);
         }
     }
     
     /**
-     * 处理控制请求
+     * v3.12: 处理任务开始
      */
-    private void handleControlRequest(String sessionId, String goal, int timeoutMs) {
-        Log.i(TAG, "Control request received: session=" + sessionId + ", goal=" + goal);
-        
-        if (taskStatus != TaskStatus.IDLE) {
-            // 已有任务在进行中，拒绝新请求
-            webSocketManager.sendAuthorization(sessionId, "denied");
-            return;
-        }
+    private void handleTaskStart(String sessionId, String goal) {
+        Log.i(TAG, "Task start: session=" + sessionId + ", goal=" + goal);
         
         // 保存任务信息
         currentSessionId = sessionId;
         currentGoal = goal;
-        taskStatus = TaskStatus.PENDING_AUTH;
-        currentStep = 0;
-        currentCost = 0.0;
+        taskStatus = TaskStatus.RUNNING;
+        isUiReporting = true;
         
-        // 显示授权弹窗
-        floatWindowManager.showAuthDialog(sessionId, goal, timeoutMs / 1000, this);
+        // 显示悬浮窗
+        floatWindowManager.showRunning(sessionId, goal);
         
-        // 设置超时自动拒绝
-        mainHandler.postDelayed(() -> {
-            if (taskStatus == TaskStatus.PENDING_AUTH) {
-                onDenied();
-            }
-        }, timeoutMs);
+        // 立即上报当前 UI
+        reportCurrentUi();
     }
     
     /**
-     * 处理动作命令
+     * v3.12: 处理任务恢复（断连重连）
+     */
+    private void handleTaskResume(TaskResume resume) {
+        Log.i(TAG, "Task resume: session=" + resume.session_id + ", status=" + resume.status);
+        
+        currentSessionId = resume.session_id;
+        currentGoal = resume.goal;
+        
+        if ("running".equals(resume.status)) {
+            taskStatus = TaskStatus.RUNNING;
+            isUiReporting = true;
+            floatWindowManager.showRunning(resume.session_id, resume.goal);
+            reportCurrentUi();  // 立即上报当前 UI
+        } else if ("paused".equals(resume.status)) {
+            taskStatus = TaskStatus.PAUSED;
+            isUiReporting = false;
+            floatWindowManager.showPaused(resume.reason != null ? resume.reason : "已暂停");
+        }
+    }
+    
+    /**
+     * v3.12: 处理动作命令
      */
     private void handleActionCommand(ActionCommandMessage cmd) {
         Log.i(TAG, "Action command: " + cmd.action + ", reason: " + cmd.reason);
         
         if (taskStatus != TaskStatus.RUNNING) {
-            Log.w(TAG, "Received action but task not running");
+            Log.w(TAG, "Received action but task not running, status=" + taskStatus);
             return;
         }
-        
-        // 更新悬浮窗显示
-        floatWindowManager.updateStatus(currentStep, currentCost, cmd.action);
         
         // 执行动作
         executeAction(cmd);
     }
     
     /**
-     * 执行动作
+     * v3.12: 执行动作（支持新动作类型）
      */
     private void executeAction(ActionCommandMessage cmd) {
         boolean success = false;
+        String errorCode = null;
+        String errorMessage = null;
         
         switch (cmd.action) {
             case "click":
                 if (cmd.target != null && cmd.target.center != null && cmd.target.center.size() >= 2) {
-                    int x = (int) (cmd.target.center.get(0) * screenWidth / 100);
-                    int y = (int) (cmd.target.center.get(1) * screenHeight / 100);
-                    success = commandExecutor.clickAt(x, y);
+                    success = commandExecutor.clickAtPercent(
+                        cmd.target.center.get(0), 
+                        cmd.target.center.get(1),
+                        screenWidth, 
+                        screenHeight
+                    );
                 }
                 break;
+                
             case "input":
-                if (cmd.text != null) {
-                    // 需要找到输入框节点
+                if (cmd.text != null && cmd.target != null && cmd.target.center != null) {
                     AccessibilityNodeInfo root = getRootInActiveWindow();
                     if (root != null) {
-                        AccessibilityNodeInfo node = findFocusedInput(root);
-                        if (node != null) {
-                            success = commandExecutor.inputText(node, cmd.text);
-                        }
+                        success = commandExecutor.inputText(
+                            cmd.target.center.get(0), 
+                            cmd.target.center.get(1),
+                            cmd.text,
+                            root,
+                            screenWidth, 
+                            screenHeight
+                        );
                         root.recycle();
                     }
                 }
                 break;
-            case "swipe_up":
-                success = commandExecutor.swipeUp(screenWidth, screenHeight);
+                
+            case "swipe":
+                if (cmd.direction != null) {
+                    Float centerX = cmd.target != null && cmd.target.center != null 
+                        ? cmd.target.center.get(0) : null;
+                    Float centerY = cmd.target != null && cmd.target.center != null 
+                        ? cmd.target.center.get(1) : null;
+                    
+                    success = commandExecutor.swipe(
+                        cmd.direction,
+                        centerX,
+                        centerY,
+                        cmd.distance,
+                        cmd.duration_ms,
+                        screenWidth, 
+                        screenHeight
+                    );
+                }
                 break;
-            case "swipe_down":
-                success = commandExecutor.swipeDown(screenWidth, screenHeight);
-                break;
-            case "swipe_left":
-                success = commandExecutor.swipeLeft(screenWidth, screenHeight);
-                break;
-            case "swipe_right":
-                success = commandExecutor.swipeRight(screenWidth, screenHeight);
-                break;
+                
             case "back":
                 success = commandExecutor.back();
                 break;
+                
             case "home":
                 success = commandExecutor.home();
                 break;
+                
+            case "launch_app":
+                if (cmd.package_name != null) {
+                    success = commandExecutor.launchApp(cmd.package_name);
+                    if (!success) {
+                        errorCode = "PACKAGE_NOT_FOUND";
+                        errorMessage = "APP未安装: " + cmd.package_name;
+                    }
+                }
+                break;
+                
+            case "wait":
+                // wait 动作：等待指定时间后重新上报 UI
+                int waitMs = cmd.wait_ms != null ? cmd.wait_ms : 1000;
+                mainHandler.postDelayed(() -> {
+                    if (taskStatus == TaskStatus.RUNNING) {
+                        reportCurrentUi();
+                    }
+                }, waitMs);
+                success = true;  // wait 立即返回成功
+                break;
+                
+            case "pause":
+                // AI 发起的暂停
+                onUserPause(cmd.reason != null ? cmd.reason : "AI 暂停");
+                success = true;
+                break;
+                
+            default:
+                Log.w(TAG, "Unknown action: " + cmd.action);
         }
         
         Log.d(TAG, "Action " + cmd.action + " result: " + success);
         
-        // 动作完成后，等待一小段时间再采集 UI（给页面刷新时间）
-        if (taskStatus == TaskStatus.RUNNING) {
-            mainHandler.postDelayed(() -> {
-                if (taskStatus == TaskStatus.RUNNING) {
-                    sendUiEvent();
-                }
-            }, 300);
+        // 上报错误
+        if (!success && errorCode != null && currentSessionId != null) {
+            webSocketManager.sendErrorEvent(currentSessionId, errorCode, errorMessage);
         }
     }
     
     /**
-     * 查找聚焦的输入框
+     * v3.12: 处理任务结束
      */
-    private AccessibilityNodeInfo findFocusedInput(AccessibilityNodeInfo node) {
-        if (node.isFocused() && node.isEditable()) {
-            return node;
-        }
-        for (int i = 0; i < node.getChildCount(); i++) {
-            AccessibilityNodeInfo child = node.getChild(i);
-            if (child != null) {
-                AccessibilityNodeInfo result = findFocusedInput(child);
-                if (result != null) {
-                    return result;
-                }
-            }
-        }
-        return null;
-    }
-    
-    /**
-     * 处理指标更新
-     */
-    private void handleMetrics(TaskMetricsMessage metrics) {
-        this.currentStep = metrics.current_step;
-        this.currentCost = metrics.current_cost;
-        floatWindowManager.updateMetrics(metrics.current_step, metrics.current_cost);
-    }
-    
-    /**
-     * 授权 - 允许
-     */
-    @Override
-    public void onAllowed() {
-        Log.i(TAG, "User allowed control: " + currentSessionId);
+    private void handleTaskEnd(String status, String result) {
+        Log.i(TAG, "Task end: status=" + status + ", result=" + result);
         
-        taskStatus = TaskStatus.RUNNING;
-        
-        // 发送授权响应
-        webSocketManager.sendAuthorization(currentSessionId, "allowed");
-        
-        // 显示状态悬浮窗
-        floatWindowManager.showStatusWindow(currentSessionId, currentGoal);
-        
-        // 立即采集并发送当前 UI
-        sendUiEvent();
-    }
-    
-    /**
-     * 授权 - 拒绝
-     */
-    @Override
-    public void onDenied() {
-        Log.i(TAG, "User denied control: " + currentSessionId);
-        
-        // 发送拒绝响应
-        if (currentSessionId != null) {
-            webSocketManager.sendAuthorization(currentSessionId, "denied");
-        }
+        // 隐藏悬浮窗
+        floatWindowManager.hide();
         
         // 重置状态
         resetTaskState();
-        floatWindowManager.showStatusBar();
     }
     
     /**
-     * 暂停后继续
+     * v3.12: 用户暂停（点击悬浮窗暂停按钮）
      */
     @Override
-    public void onResume() {
+    public void onUserPause(String reason) {
+        Log.i(TAG, "User paused task: " + reason);
+        
+        if (taskStatus != TaskStatus.RUNNING) return;
+        
+        taskStatus = TaskStatus.PAUSED;
+        stopUiReporting();
+        
+        // 发送暂停请求到云端
+        if (currentSessionId != null) {
+            webSocketManager.sendPauseRequest(currentSessionId);
+        }
+        
+        // 更新悬浮窗
+        floatWindowManager.showPaused(reason);
+    }
+    
+    /**
+     * v3.12: 用户继续（点击悬浮窗继续按钮）
+     */
+    @Override
+    public void onUserResume() {
         Log.i(TAG, "User resumed task");
         
         if (taskStatus != TaskStatus.PAUSED) return;
         
-        isPaused = false;
         taskStatus = TaskStatus.RUNNING;
+        isUiReporting = true;
         
+        // 发送恢复请求到云端
         if (currentSessionId != null) {
-            webSocketManager.sendResume(currentSessionId);
+            webSocketManager.sendResumeRequest(currentSessionId);
         }
         
-        // 重新显示状态窗口
-        floatWindowManager.showStatusWindow(currentSessionId, currentGoal);
+        // 更新悬浮窗
+        floatWindowManager.showRunning(currentSessionId, currentGoal);
         
-        // 发送当前 UI 状态
-        sendUiEvent();
+        // 立即上报当前 UI
+        reportCurrentUi();
     }
     
     /**
-     * 暂停后取消
+     * v3.12: 用户结束任务（点击悬浮窗结束按钮）
      */
     @Override
-    public void onCancel() {
-        Log.i(TAG, "User cancelled task from pause");
-        endTask("cancelled", "用户取消任务");
+    public void onUserStop() {
+        Log.i(TAG, "User stopped task");
+        
+        if (currentSessionId != null) {
+            webSocketManager.sendStopRequest(currentSessionId);
+        }
+        
+        endTask("cancelled", "用户结束任务");
+    }
+    
+    /**
+     * v3.12: 停止 UI 上报
+     */
+    public void stopUiReporting() {
+        isUiReporting = false;
+        
+        // 取消待上报的 UI 事件
+        if (pendingUiEvent != null) {
+            uiEventHandler.removeCallbacks(pendingUiEvent);
+            pendingUiEvent = null;
+        }
     }
     
     /**
@@ -426,7 +548,7 @@ public class GhostTapService extends AccessibilityService implements
             Config.UI_EVENT_DEBOUNCE - (now - lastUiEventTime) : 0;
         
         pendingUiEvent = () -> {
-            sendUiEvent();
+            reportCurrentUi();
             lastUiEventTime = System.currentTimeMillis();
         };
         
@@ -434,9 +556,9 @@ public class GhostTapService extends AccessibilityService implements
     }
     
     /**
-     * 采集并发送 UI 事件
+     * v3.12: 采集并发送当前 UI
      */
-    private void sendUiEvent() {
+    public void reportCurrentUi() {
         if (!webSocketManager.isConnected() || currentSessionId == null) {
             return;
         }
@@ -447,9 +569,10 @@ public class GhostTapService extends AccessibilityService implements
         String packageName = root.getPackageName() != null ? root.getPackageName().toString() : "";
         String className = root.getClassName() != null ? root.getClassName().toString() : "";
         
+        // v3.12: 传递 service 用于软键盘检测
         UiEventMessage uiEvent = uiCollector.collect(
+            this,  // AccessibilityService
             root,
-            Config.getUserId(),
             currentSessionId,
             packageName,
             className,
@@ -466,8 +589,13 @@ public class GhostTapService extends AccessibilityService implements
      * 结束任务
      */
     private void endTask(String status, String result) {
+        // 停止 UI 上报
+        stopUiReporting();
+        
         // 隐藏悬浮窗
-        floatWindowManager.release();
+        if (floatWindowManager != null) {
+            floatWindowManager.hide();
+        }
         
         // 重置状态
         resetTaskState();
@@ -482,9 +610,8 @@ public class GhostTapService extends AccessibilityService implements
         currentSessionId = null;
         currentGoal = null;
         taskStatus = TaskStatus.IDLE;
-        isPaused = false;
-        currentStep = 0;
-        currentCost = 0.0;
+        isUiReporting = false;
+        lastUiEventTime = 0;
     }
     
     /**
@@ -518,15 +645,6 @@ public class GhostTapService extends AccessibilityService implements
     }
     
     /**
-     * 主动请求停止任务
-     */
-    public void stopCurrentTask() {
-        if (currentSessionId != null) {
-            endTask("cancelled", "用户主动停止");
-        }
-    }
-    
-    /**
      * 检查服务是否运行中
      */
     public static boolean isRunning() {
@@ -538,5 +656,19 @@ public class GhostTapService extends AccessibilityService implements
      */
     public static GhostTapService getInstance() {
         return instance;
+    }
+    
+    /**
+     * 停止当前任务（供外部调用，如 MainActivity 停止服务时）
+     */
+    public void stopCurrentTask() {
+        if (currentSessionId != null) {
+            // 发送停止请求到云端
+            if (webSocketManager != null) {
+                webSocketManager.sendStopRequest(currentSessionId);
+            }
+            // 结束本地任务
+            endTask("cancelled", "用户停止服务");
+        }
     }
 }

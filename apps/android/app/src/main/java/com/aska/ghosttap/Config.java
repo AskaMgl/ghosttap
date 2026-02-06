@@ -1,7 +1,7 @@
 package com.aska.ghosttap;
 
 /**
- * GhostTap 配置文件
+ * GhostTap 配置文件 (v3.12)
  * 
  * 包含服务端连接配置、心跳间隔、重连策略等常量
  */
@@ -12,6 +12,7 @@ public class Config {
     /**
      * WebSocket 服务器地址
      * 使用 wss:// 进行加密传输
+     * v3.12: 认证信息通过 URL query 参数传递，不在 URL 中硬编码
      */
     public static final String SERVER_URL = "wss://your-server.com/ws";
     
@@ -30,16 +31,17 @@ public class Config {
     
     /**
      * 设备名称（用于显示）
+     * v3.12: 连接时上报给服务器
      */
     public static String DEVICE_NAME = "Android设备";
     
-    // ========== 心跳配置 ==========
+    // ========== 心跳配置 (v3.12: 90秒间隔) ==========
     
     /**
      * 心跳间隔（毫秒）
-     * 默认 3 分钟
+     * v3.12: 90秒，适配部分运营商 NAT 超时低至 60-120 秒
      */
-    public static final long HEARTBEAT_INTERVAL = 3 * 60 * 1000L;
+    public static final long HEARTBEAT_INTERVAL = 90 * 1000L;
     
     /**
      * 心跳超时时间（毫秒）
@@ -62,27 +64,15 @@ public class Config {
     
     /**
      * UI 事件上报防抖时间（毫秒）
-     * 防止界面频繁变化导致大量上报
+     * v3.12: 300ms，合并连续事件
      */
     public static final long UI_EVENT_DEBOUNCE = 300L;
-    
-    // ========== 悬浮窗配置 ==========
-    
-    /**
-     * 授权弹窗超时时间（毫秒）
-     */
-    public static final long AUTH_TIMEOUT = 60000L;
-    
-    /**
-     * 悬浮窗状态栏高度（dp）
-     */
-    public static final int FLOAT_WINDOW_HEIGHT = 60;
     
     // ========== UI 采集配置 ==========
     
     /**
      * 最大 UI 元素数量
-     * 超过此数量将只保留最前面的元素
+     * v3.12: 50个，超过将截断并设置 truncated=true
      */
     public static final int MAX_UI_ELEMENTS = 50;
     
@@ -120,9 +110,11 @@ public class Config {
     public static final String PREF_SERVER_URL = "server_url";
     
     /**
-     * UI 事件节流间隔（毫秒）
+     * 设备名称存储键
      */
-    public static final long UI_EVENT_THROTTLE_MS = 300L;
+    public static final String PREF_DEVICE_NAME = "device_name";
+    
+    // ========== 方法 ==========
     
     /**
      * 获取用户 ID

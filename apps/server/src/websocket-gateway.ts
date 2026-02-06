@@ -3,27 +3,35 @@ import { config } from './config';
 import { logger } from './logger';
 import { sessionManager } from './session-manager';
 import { aiCore } from './ai-core';
-// 通知通过统一的 OpenClaw Skill 回调机制发送，不再直接使用 Feishu Webhook
 import { dbManager } from './database';
 import { httpApi } from './http-api';
+import { UiFormatter } from './formatter';
 import { 
   ClientMessage, 
   ServerMessage, 
   PingMessage,
   UiEventMessage,
-  AuthorizationMessage,
-  ResumeMessage,
-  TaskSession,
+  PauseRequest,
+  ResumeRequest,
+  StopRequest,
+  ErrorEvent,
+  SessionContext,
+  TaskResume,
 } from './types';
 
 /**
  * WebSocket Gateway - WebSocket服务器
  * 
- * 职责：
- * 1. 管理WebSocket连接（单设备绑定：同一user_id只能有一个连接）
- * 2. 处理心跳保活
- * 3. 路由消息到处理函数
- * 4. 管理会话生命周期
+ * v3.12 全面重构:
+ * 1. 认证方式改为URL参数解析（?user_id=xxx&device_name=xxx）
+ * 2. 移除 sendControlRequest 授权流程
+ * 3. 任务创建后直接发送 TaskStart
+ * 4. 添加 StopRequest、ErrorEvent 消息处理
+ * 5. 断连恢复时发送 TaskResume
+ * 6. 添加 session 级别的 aiCallInFlight 互斥锁
+ * 7. 过期决策丢弃改用 timestamp 比较
+ * 8. 心跳间隔改为90秒
+ * 9. 添加第一层敏感词硬检测（调用AI前）
  */
 export class WebSocketGateway {
   private wss: WebSocketServer | null = null;
@@ -41,15 +49,62 @@ export class WebSocketGateway {
 
     this.wss.on('connection', (ws, req) => {
       const clientIp = req.socket.remoteAddress;
-      logger.info('New WebSocket connection', { ip: clientIp });
+      
+      // v3.12: 从URL参数解析认证信息
+      const url = new URL(req.url || '/', `http://${req.headers.host}`);
+      const userId = url.searchParams.get('user_id');
+      const deviceName = url.searchParams.get('device_name') || '未知设备';
+      
+      logger.info('New WebSocket connection', { 
+        ip: clientIp, 
+        user_id: userId,
+        device_name: deviceName 
+      });
+
+      // v3.12: 验证 user_id
+      if (!userId) {
+        logger.warn('Connection rejected: missing user_id');
+        ws.close(1002, 'Missing user_id parameter');
+        return;
+      }
+
+      // v3.12: 单设备绑定 - 如果该用户已有连接，踢掉旧连接
+      const existingWs = this.userConnections.get(userId);
+      if (existingWs && existingWs !== ws && existingWs.readyState === WebSocket.OPEN) {
+        logger.info('Single device binding: kicking old connection', { user_id: userId });
+        
+        this.send(existingWs, {
+          type: 'task_end',
+          session_id: '',
+          status: 'cancelled',
+          result: '已在其他设备上连接',
+        });
+        
+        existingWs.close(1000, 'New connection from same user');
+        this.clients.delete(existingWs);
+      }
 
       // 初始化客户端信息
-      this.clients.set(ws, {
+      const clientInfo: ClientInfo = {
         ws,
-        user_id: null,
+        user_id: userId,
+        device_name: deviceName,
         lastPing: Date.now(),
-        isAuthenticated: false,
-      });
+        isAuthenticated: true, // v3.12: URL认证，立即通过
+      };
+      
+      this.clients.set(ws, clientInfo);
+      this.userConnections.set(userId, ws);
+      
+      // v3.12: 更新设备绑定（包含 device_name）
+      dbManager.updateDeviceBinding(userId, deviceName).catch(err => 
+        logger.error('Failed to update device binding', err)
+      );
+
+      logger.info('Client authenticated via URL', { user_id: userId, device_name: deviceName });
+
+      // v3.12: 断连恢复检查 - 如果有running/paused状态的任务，发送TaskResume
+      this.handleReconnectResume(userId, ws);
 
       // 设置消息处理
       ws.on('message', (data) => {
@@ -59,6 +114,7 @@ export class WebSocketGateway {
       // 设置关闭处理
       ws.on('close', (code, reason) => {
         logger.info('WebSocket connection closed', { 
+          user_id: userId,
           code, 
           reason: reason.toString() 
         });
@@ -67,14 +123,13 @@ export class WebSocketGateway {
 
       // 设置错误处理
       ws.on('error', (error) => {
-        logger.error('WebSocket error', error);
+        logger.error('WebSocket error', error, { user_id: userId });
       });
 
-      // 发送欢迎消息
+      // v3.12: 发送欢迎pong
       this.send(ws, { 
         type: 'pong', 
-        timestamp: Date.now(), 
-        server_time: Date.now() 
+        timestamp: Date.now()
       });
     });
 
@@ -82,12 +137,42 @@ export class WebSocketGateway {
       logger.error('WebSocket server error', error);
     });
 
-    // 启动心跳检查
+    // v3.12: 心跳检查间隔改为30秒（心跳超时是3分钟，每30秒检查一次）
     this.heartbeatChecker = setInterval(() => {
       this.checkHeartbeats();
-    }, 30000); // 每30秒检查一次
+    }, 30000);
 
     logger.info('WebSocket server started', { host, port });
+  }
+
+  /**
+   * v3.12: 断连恢复处理
+   * 如果有running/paused状态的任务，发送TaskResume
+   */
+  private async handleReconnectResume(userId: string, ws: WebSocket): Promise<void> {
+    const activeSession = sessionManager.getUserActiveSessionSync(userId);
+    
+    if (activeSession && (activeSession.status === 'running' || activeSession.status === 'paused')) {
+      logger.info('Resuming task after reconnect', { 
+        session_id: activeSession.session_id,
+        user_id: userId,
+        status: activeSession.status
+      });
+      
+      // 更新会话的设备连接
+      sessionManager.updateSessionStatus(activeSession.session_id, activeSession.status, ws as any);
+      
+      // 发送 TaskResume 消息
+      const resumeMsg: TaskResume = {
+        type: 'task_resume',
+        session_id: activeSession.session_id,
+        goal: activeSession.goal,
+        status: activeSession.status,
+        reason: activeSession.status === 'paused' ? '用户暂停' : undefined,
+      };
+      
+      this.send(ws, resumeMsg);
+    }
   }
 
   /**
@@ -102,7 +187,7 @@ export class WebSocketGateway {
       
       logger.debug('Received message', { 
         type: message.type, 
-        user_id: (message as any).user_id 
+        user_id: clientInfo.user_id 
       });
 
       switch (message.type) {
@@ -112,11 +197,17 @@ export class WebSocketGateway {
         case 'ui_event':
           await this.handleUiEvent(ws, message);
           break;
-        case 'authorization':
-          await this.handleAuthorization(ws, message);
+        case 'pause':
+          await this.handlePause(ws, message);
           break;
         case 'resume':
           await this.handleResume(ws, message);
+          break;
+        case 'stop': // v3.12: 新增 StopRequest 处理
+          await this.handleStop(ws, message);
+          break;
+        case 'error': // v3.12: 新增 ErrorEvent 处理
+          await this.handleError(ws, message);
           break;
         default:
           logger.warn('Unknown message type', { type: (message as any).type });
@@ -128,6 +219,7 @@ export class WebSocketGateway {
 
   /**
    * 处理心跳消息
+   * v3.12: Ping移除user_id，Pong移除server_time
    */
   private async handlePing(ws: WebSocket, message: PingMessage): Promise<void> {
     const clientInfo = this.clients.get(ws);
@@ -136,65 +228,24 @@ export class WebSocketGateway {
     // 更新心跳时间
     clientInfo.lastPing = Date.now();
     
-    // 认证用户
-    if (message.user_id && !clientInfo.isAuthenticated) {
-      // 单设备绑定：如果该用户已有连接，踢掉旧连接
-      const existingWs = this.userConnections.get(message.user_id);
-      if (existingWs && existingWs !== ws && existingWs.readyState === WebSocket.OPEN) {
-        logger.info('Single device binding: kicking old connection', { 
-          user_id: message.user_id 
-        });
-        
-        // 发送被踢通知
-        this.send(existingWs, {
-          type: 'task_end',
-          session_id: '',
-          status: 'cancelled',
-          result: '已在其他设备上连接',
-        });
-        
-        existingWs.close(1000, 'New connection from same user');
-      }
-      
-      clientInfo.user_id = message.user_id;
-      clientInfo.isAuthenticated = true;
-      this.userConnections.set(message.user_id, ws);
-      
-      // 更新设备绑定
-      await dbManager.updateDeviceBinding(message.user_id);
-      
-      logger.info('Client authenticated', { user_id: message.user_id });
-      
-      // 通过回调通知设备连接（如果有活跃会话）
-      const activeSession = sessionManager.getUserActiveSessionSync(message.user_id);
-      if (activeSession?.callback_url) {
-        await httpApi.sendCallback(activeSession.callback_url, {
-          type: 'device_connected',
-          user_id: message.user_id,
-        });
-      }
-      
-      // 检查是否有待处理的会话，更新设备连接
-      if (activeSession && activeSession.status === 'pending') {
-        sessionManager.updateSessionStatus(activeSession.session_id, 'pending', ws as any);
-      }
-    }
-
     // 更新数据库中的最后ping时间
     if (clientInfo.user_id) {
       await dbManager.updateDeviceBinding(clientInfo.user_id);
     }
 
-    // 回复pong
+    // v3.12: 回复pong（只回显timestamp）
     this.send(ws, {
       type: 'pong',
       timestamp: message.timestamp,
-      server_time: Date.now(),
     });
   }
 
   /**
    * 处理UI事件
+   * v3.12: 
+   * - 添加第一层敏感词硬检测（调用AI前）
+   * - 使用 timestamp 比较进行过期决策丢弃
+   * - 添加 aiCallInFlight 互斥锁
    */
   private async handleUiEvent(ws: WebSocket, message: UiEventMessage): Promise<void> {
     const clientInfo = this.clients.get(ws);
@@ -210,8 +261,12 @@ export class WebSocketGateway {
       return;
     }
 
-    // 只有在运行状态时才进行AI决策
+    // v3.12: 只有在 running 状态时才处理UI事件
     if (session.status !== 'running') {
+      logger.debug('Ignoring UI event, session not running', { 
+        session_id: session.session_id,
+        status: session.status 
+      });
       return;
     }
 
@@ -225,15 +280,93 @@ export class WebSocketGateway {
       return;
     }
 
-    try {
-      // AI决策
-      const { decision, inputTokens, outputTokens } = await aiCore.decide(session, message);
+    // v3.12: 第一层敏感词硬检测（零成本、零延迟、不可绕过）
+    const sensitiveCheck = UiFormatter.detectSensitiveOperations(message);
+    if (sensitiveCheck.isSensitive) {
+      logger.info('Sensitive operation detected (first layer), pausing', { 
+        session_id: session.session_id,
+        reason: sensitiveCheck.reason 
+      });
+      
+      // 发送pause指令
+      this.send(ws, {
+        type: 'action',
+        action: 'pause',
+        reason: sensitiveCheck.reason!,
+      });
+      
+      // 更新会话状态为paused
+      sessionManager.updateSessionStatus(session.session_id, 'paused');
       
       // 记录动作
       sessionManager.addActionRecord(
         session.session_id,
-        decision.action,
-        decision.reason
+        'pause',
+        sensitiveCheck.reason!
+      );
+      
+      return;
+    }
+
+    // v3.12: AI调用互斥锁检查
+    if (session.aiCallInFlight) {
+      logger.debug('AI call already in flight, skipping', { 
+        session_id: session.session_id 
+      });
+      return;
+    }
+
+    // v3.12: 记录当前UI事件的时间戳，用于过期检测
+    const currentUiTimestamp = message.timestamp;
+
+    // 设置AI调用锁
+    sessionManager.setAiCallInFlight(session.session_id, true);
+
+    try {
+      // v3.12: 使用循环处理过期决策丢弃
+      let decision;
+      let inputTokens = 0;
+      let outputTokens = 0;
+      let retryCount = 0;
+      const maxRetries = 3;
+
+      while (retryCount < maxRetries) {
+        // 获取当前最新的UI事件时间戳
+        const latestSession = sessionManager.getSessionSync(session.session_id);
+        const latestTimestamp = latestSession?.latestUiTimestamp || currentUiTimestamp;
+
+        // AI决策
+        const result = await aiCore.decide(session, message);
+        decision = result.decision;
+        inputTokens = result.inputTokens;
+        outputTokens = result.outputTokens;
+
+        // v3.12: 使用 timestamp 比较判断UI是否已过期
+        if (latestTimestamp === currentUiTimestamp) {
+          // UI未变化，决策有效
+          break;
+        }
+
+        // UI已更新，丢弃旧决策，继续循环处理最新UI
+        logger.warn('UI changed during AI thinking, discarding stale decision', {
+          session_id: session.session_id,
+          retry: retryCount + 1
+        });
+        retryCount++;
+      }
+
+      if (retryCount >= maxRetries) {
+        logger.error('Max retries exceeded for stale decision, giving up', {
+          session_id: session.session_id
+        });
+        return;
+      }
+
+      // 记录动作
+      sessionManager.addActionRecord(
+        session.session_id,
+        decision!.action,
+        decision!.reason
       );
 
       // 更新实际Token消耗
@@ -241,18 +374,33 @@ export class WebSocketGateway {
         sessionManager.updateMetrics(session.session_id, inputTokens, outputTokens);
       }
 
+      // v3.12: 处理 done/fail 终止指令
+      if (decision!.action === 'done') {
+        await this.endTask(session, 'completed', decision!.reason);
+        return;
+      } else if (decision!.action === 'fail') {
+        await this.endTask(session, 'failed', decision!.reason);
+        return;
+      }
+
       // 转换为命令
-      const command = aiCore.decisionToCommand(decision);
+      const command = aiCore.decisionToCommand(decision!);
+
+      // v3.12: 再次检查状态（防止AI调用期间状态改变）
+      const currentSession = sessionManager.getSessionSync(session.session_id);
+      if (currentSession?.status !== 'running') {
+        logger.debug('Session no longer running, discarding decision', {
+          session_id: session.session_id,
+          status: currentSession?.status
+        });
+        return;
+      }
 
       // 发送给手机
       this.send(ws, command);
 
-      // 检查是否任务结束
-      if (command.action === 'done') {
-        await this.endTask(session, 'completed', decision.reason);
-      } else if (command.action === 'fail') {
-        await this.endTask(session, 'failed', decision.reason);
-      } else if (command.action === 'pause') {
+      // v3.12: 检查是否需要暂停
+      if (command.action === 'pause') {
         sessionManager.updateSessionStatus(session.session_id, 'paused');
       }
 
@@ -262,47 +410,40 @@ export class WebSocketGateway {
       this.send(ws, {
         type: 'action',
         action: 'wait',
+        wait_ms: 2000,
         reason: 'AI决策出错，等待重试',
-        expect: '等待后重试',
-        ms: 2000,
       });
+    } finally {
+      // 释放AI调用锁
+      sessionManager.setAiCallInFlight(session.session_id, false);
     }
   }
 
   /**
-   * 处理授权响应
+   * 处理暂停请求（用户点击悬浮窗暂停按钮）
    */
-  private async handleAuthorization(ws: WebSocket, message: AuthorizationMessage): Promise<void> {
+  private async handlePause(ws: WebSocket, message: PauseRequest): Promise<void> {
     const session = sessionManager.getSessionSync(message.session_id);
     if (!session) {
-      logger.warn('Authorization for unknown session', { session_id: message.session_id });
+      logger.warn('Pause for unknown session', { session_id: message.session_id });
       return;
     }
 
-    if (message.decision === 'allowed') {
-      logger.info('Authorization granted', { session_id: message.session_id });
-      sessionManager.updateSessionStatus(message.session_id, 'running', ws as any);
-      
-      // 通过回调通知授权成功
-      if (session.callback_url) {
-        await httpApi.sendCallback(session.callback_url, {
-          type: 'auth_result',
-          user_id: session.user_id,
-          session_id: session.session_id,
-          decision: 'allowed',
-          goal: session.goal,
-        });
-      }
-    } else {
-      logger.info('Authorization denied', { session_id: message.session_id });
-      await this.endTask(session, 'cancelled', '用户拒绝授权');
+    if (session.status === 'running') {
+      logger.info('User paused session', { session_id: message.session_id });
+      sessionManager.updateSessionStatus(message.session_id, 'paused');
+      sessionManager.addActionRecord(
+        message.session_id,
+        'pause',
+        '用户点击暂停按钮'
+      );
     }
   }
 
   /**
-   * 处理恢复请求
+   * 处理恢复请求（用户点击悬浮窗继续按钮）
    */
-  private async handleResume(ws: WebSocket, message: ResumeMessage): Promise<void> {
+  private async handleResume(ws: WebSocket, message: ResumeRequest): Promise<void> {
     const session = sessionManager.getSessionSync(message.session_id);
     if (!session) {
       logger.warn('Resume for unknown session', { session_id: message.session_id });
@@ -310,15 +451,59 @@ export class WebSocketGateway {
     }
 
     if (session.status === 'paused') {
-      logger.info('Resuming session', { session_id: message.session_id });
+      logger.info('User resumed session', { session_id: message.session_id });
       sessionManager.updateSessionStatus(message.session_id, 'running');
+      sessionManager.addActionRecord(
+        message.session_id,
+        'resume',
+        '用户点击继续按钮'
+      );
       
-      // 基于最后收到的UI事件继续执行
-      if (session.last_ui_event) {
-        const { decision } = await aiCore.decide(session, session.last_ui_event);
-        const command = aiCore.decisionToCommand(decision);
-        this.send(ws, command);
-      }
+      // v3.12: 不立即执行AI决策，等待手机端重新上报UI事件
+      // 手机端会在发送 resume 后立即上报当前UI
+    }
+  }
+
+  /**
+   * v3.12: 新增 StopRequest 处理（用户点击悬浮窗结束按钮）
+   */
+  private async handleStop(ws: WebSocket, message: StopRequest): Promise<void> {
+    const session = sessionManager.getSessionSync(message.session_id);
+    if (!session) {
+      logger.warn('Stop for unknown session', { session_id: message.session_id });
+      return;
+    }
+
+    logger.info('User stopped session', { session_id: message.session_id });
+    await this.endTask(session, 'cancelled', '用户点击结束按钮');
+  }
+
+  /**
+   * v3.12: 新增 ErrorEvent 处理（手机端执行动作失败）
+   */
+  private async handleError(ws: WebSocket, message: ErrorEvent): Promise<void> {
+    const session = sessionManager.getSessionSync(message.session_id);
+    if (!session) {
+      logger.warn('Error for unknown session', { session_id: message.session_id });
+      return;
+    }
+
+    logger.error('Client reported error', { 
+      session_id: message.session_id,
+      error: message.error,
+      message: message.message
+    });
+
+    // 记录错误
+    sessionManager.addActionRecord(
+      message.session_id,
+      'error',
+      `${message.error}: ${message.message}`
+    );
+
+    // 如果是PACKAGE_NOT_FOUND等致命错误，结束任务
+    if (message.error === 'PACKAGE_NOT_FOUND') {
+      await this.endTask(session, 'failed', message.message);
     }
   }
 
@@ -331,34 +516,28 @@ export class WebSocketGateway {
       // 从用户连接映射中移除
       this.userConnections.delete(clientInfo.user_id);
       
-      // 移除设备绑定
-      await dbManager.removeDeviceBinding(clientInfo.user_id);
-      
-      // 通过回调通知设备断开（如果有活跃会话）
-      const activeSession = sessionManager.getUserActiveSessionSync(clientInfo.user_id);
-      if (activeSession?.callback_url) {
-        await httpApi.sendCallback(activeSession.callback_url, {
-          type: 'device_disconnected',
-          user_id: clientInfo.user_id,
-        });
-      }
-      
       logger.info('Device disconnected', { user_id: clientInfo.user_id });
+      
+      // v3.12: 不立即标记任务失败，给断连宽限期
+      // 任务超时检查由 session-manager 的 cleanupExpiredSessions 处理
     }
     this.clients.delete(ws);
   }
 
   /**
    * 检查心跳超时
+   * v3.12: 心跳间隔90秒，超时时间3分钟
    */
   private checkHeartbeats(): void {
     const now = Date.now();
-    const timeout = config.heartbeatTimeout;
+    const timeout = config.heartbeatTimeout; // 3分钟
 
     for (const [ws, clientInfo] of this.clients) {
       if (now - clientInfo.lastPing > timeout) {
         logger.warn('Heartbeat timeout, closing connection', { 
-          user_id: clientInfo.user_id 
+          user_id: clientInfo.user_id,
+          lastPing: clientInfo.lastPing,
+          timeout
         });
         ws.terminate();
         this.clients.delete(ws);
@@ -379,33 +558,33 @@ export class WebSocketGateway {
   }
 
   /**
-   * 发送控制请求给设备
+   * v3.12: 检查设备是否已连接
    */
-  async sendControlRequest(userId: string, session: TaskSession): Promise<boolean> {
+  isDeviceConnected(userId: string): boolean {
+    const ws = this.userConnections.get(userId);
+    return ws !== undefined && ws.readyState === WebSocket.OPEN;
+  }
+
+  /**
+   * v3.12: 发送 TaskStart 消息（替代原来的 sendControlRequest 授权流程）
+   */
+  sendTaskStart(userId: string, session: SessionContext): boolean {
     const ws = this.userConnections.get(userId);
     
     if (ws && ws.readyState === WebSocket.OPEN) {
       this.send(ws, {
-        type: 'request_control',
-        user_id: userId,
+        type: 'task_start',
         session_id: session.session_id,
         goal: session.goal,
-        timeout_ms: config.authTimeout,
       });
       
       // 更新会话的设备连接
-      sessionManager.updateSessionStatus(session.session_id, 'pending', ws as any);
+      sessionManager.updateSessionStatus(session.session_id, 'running', ws as any);
       
-      // 通过回调发送授权请求通知
-      if (session.callback_url) {
-        await httpApi.sendCallback(session.callback_url, {
-          type: 'auth_request',
-          user_id: userId,
-          session_id: session.session_id,
-          goal: session.goal,
-          timeout_sec: config.authTimeout / 1000,
-        });
-      }
+      logger.info('TaskStart sent to device', { 
+        session_id: session.session_id,
+        user_id: userId 
+      });
       
       return true;
     }
@@ -415,16 +594,18 @@ export class WebSocketGateway {
 
   /**
    * 结束任务
+   * v3.12: 回调只发送 task_completed
    */
-  private async endTask(session: TaskSession, status: 'completed' | 'failed' | 'cancelled', result: string): Promise<void> {
+  private async endTask(session: SessionContext, status: 'completed' | 'failed' | 'cancelled', result: string): Promise<void> {
     const endedSession = sessionManager.endSession(session.session_id, status, result);
     
     if (!endedSession) return;
     
     // 发送任务结束消息到设备
-    if (session.device_ws) {
+    const ws = this.userConnections.get(session.user_id);
+    if (ws && ws.readyState === WebSocket.OPEN) {
       const taskStatus = status === 'completed' ? 'success' : status;
-      this.send(session.device_ws as any, {
+      this.send(ws, {
         type: 'task_end',
         session_id: session.session_id,
         status: taskStatus as 'success' | 'failed' | 'cancelled',
@@ -432,7 +613,7 @@ export class WebSocketGateway {
       });
     }
     
-    // 通过回调通知 OpenClaw Skill（由 Skill 负责发送消息给用户）
+    // v3.12: 只通过回调发送 task_completed
     if (session.callback_url) {
       await httpApi.sendCallback(session.callback_url, {
         type: 'task_completed',
@@ -480,7 +661,8 @@ export class WebSocketGateway {
 
 interface ClientInfo {
   ws: WebSocket;
-  user_id: string | null;
+  user_id: string;
+  device_name: string;
   lastPing: number;
   isAuthenticated: boolean;
 }

@@ -17,6 +17,7 @@ import android.widget.TextView;
 import android.widget.Toast;
 
 import android.view.accessibility.AccessibilityManager;
+import android.os.Handler;
 
 /**
  * GhostTap 主界面

@@ -94,6 +94,7 @@ export class DatabaseManager {
     await this.db.exec(`
       CREATE TABLE IF NOT EXISTS device_bindings (
         user_id TEXT PRIMARY KEY,
+        device_name TEXT,
         connected_at INTEGER NOT NULL,
         last_ping INTEGER NOT NULL
       )
@@ -263,14 +264,18 @@ export class DatabaseManager {
 
   /**
    * 更新设备绑定（单设备绑定）
+   * v3.12: 添加 device_name 字段
    */
-  async updateDeviceBinding(userId: string): Promise<void> {
+  async updateDeviceBinding(userId: string, deviceName?: string): Promise<void> {
     if (!this.db) return;
 
     const now = Date.now();
     await this.db.run(
-      `INSERT OR REPLACE INTO device_bindings (user_id, connected_at, last_ping)
-      VALUES (?, COALESCE((SELECT connected_at FROM device_bindings WHERE user_id = ?), ?), ?)`,
+      `INSERT OR REPLACE INTO device_bindings (user_id, device_name, connected_at, last_ping)
+      VALUES (?, COALESCE(?, (SELECT device_name FROM device_bindings WHERE user_id = ?)), 
+              COALESCE((SELECT connected_at FROM device_bindings WHERE user_id = ?), ?), ?)`,
+      userId,
+      deviceName || null,
       userId,
       userId,
       now,

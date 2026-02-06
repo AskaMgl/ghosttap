@@ -15,6 +15,10 @@ import { dbManager } from './database';
  * - GET /api/tasks/:sessionId/history - 获取任务历史
  * - GET /api/stats - 获取服务器统计
  * - GET /health - 健康检查
+ * 
+ * v3.12 更新:
+ * - 任务创建后直接开始（不需要等待授权）
+ * - 更新响应消息
  */
 export class HttpApiServer {
   private server: http.Server | null = null;
@@ -97,6 +101,7 @@ export class HttpApiServer {
 
   /**
    * 创建新任务
+   * v3.12: 任务创建后直接开始，不需要等待授权
    */
   private async handleCreateTask(req: http.IncomingMessage, res: http.ServerResponse): Promise<void> {
     const body = await this.readBody(req);
@@ -105,41 +110,62 @@ export class HttpApiServer {
     const { user_id, goal, callback_url } = data;
 
     if (!user_id || !goal) {
-      this.sendJson(res, 400, { error: 'Missing required fields: user_id, goal' });
+      this.sendJson(res, 400, { 
+        success: false,
+        error: 'MISSING_FIELDS',
+        message: 'Missing required fields: user_id, goal' 
+      });
       return;
     }
 
     // 检查用户是否已有活跃任务（同步检查缓存）
     const existingSession = sessionManager.getUserActiveSessionSync(user_id);
     if (existingSession) {
-      // 结束旧任务
-      sessionManager.endSession(existingSession.session_id, 'cancelled', '新任务覆盖');
-    }
-
-    // 创建新会话（传入 callback_url）
-    const session = sessionManager.createSession(user_id, goal, undefined, callback_url);
-
-    // 尝试发送控制请求给设备
-    const deviceConnected = await wsGateway.sendControlRequest(user_id, session);
-
-    if (!deviceConnected) {
-      // 设备未连接，等待设备连接后再发送请求
-      logger.info('Device not connected, waiting for connection', { 
-        session_id: session.session_id,
+      // v3.12: 结束旧任务（新任务覆盖）
+      const oldSessionId = existingSession.session_id;
+      sessionManager.endSession(oldSessionId, 'cancelled', '新任务覆盖');
+      logger.info('Replaced existing task', { 
+        old_session_id: oldSessionId,
         user_id 
       });
     }
 
-    this.sendJson(res, 201, {
-      session_id: session.session_id,
-      user_id: session.user_id,
-      goal: session.goal,
-      status: session.status,
-      device_connected: deviceConnected,
-      message: deviceConnected 
-        ? '已向设备发送接管请求，请在手机上确认'
-        : '等待设备连接...',
-    });
+    // v3.12: 检查设备是否已连接
+    const deviceConnected = wsGateway.isDeviceConnected(user_id);
+
+    // 创建新会话（状态直接为 running）
+    const session = sessionManager.createSession(user_id, goal, undefined, callback_url);
+
+    if (deviceConnected) {
+      // v3.12: 设备已连接，直接发送 TaskStart
+      const sent = wsGateway.sendTaskStart(user_id, session);
+      
+      this.sendJson(res, 201, {
+        success: true,
+        session_id: session.session_id,
+        user_id: session.user_id,
+        goal: session.goal,
+        status: session.status,
+        device_connected: true,
+        message: '任务已创建，开始执行',
+      });
+    } else {
+      // 设备未连接，任务已创建但等待设备连接
+      logger.info('Task created but device not connected', { 
+        session_id: session.session_id,
+        user_id 
+      });
+
+      this.sendJson(res, 200, {
+        success: true,
+        session_id: session.session_id,
+        user_id: session.user_id,
+        goal: session.goal,
+        status: session.status,
+        device_connected: false,
+        message: '任务已创建，但您的手机尚未连接，请先打开 GhostTap APP',
+      });
+    }
   }
 
   /**
@@ -155,11 +181,16 @@ export class HttpApiServer {
     }
     
     if (!session) {
-      this.sendJson(res, 404, { error: 'Session not found' });
+      this.sendJson(res, 404, { 
+        success: false,
+        error: 'SESSION_NOT_FOUND',
+        message: 'Session not found' 
+      });
       return;
     }
 
     this.sendJson(res, 200, {
+      success: true,
       session_id: session.session_id,
       user_id: session.user_id,
       goal: session.goal,
@@ -190,11 +221,16 @@ export class HttpApiServer {
     }
     
     if (!session) {
-      this.sendJson(res, 404, { error: 'Session not found' });
+      this.sendJson(res, 404, { 
+        success: false,
+        error: 'SESSION_NOT_FOUND',
+        message: 'Session not found' 
+      });
       return;
     }
 
     this.sendJson(res, 200, {
+      success: true,
       session_id: session.session_id,
       history: session.history,
     });
@@ -208,6 +244,7 @@ export class HttpApiServer {
     const sessionStats = sessionManager.getStats();
 
     this.sendJson(res, 200, {
+      success: true,
       server: {
         uptime: process.uptime(),
         memory: process.memoryUsage(),
@@ -239,7 +276,7 @@ export class HttpApiServer {
 
   /**
    * 发送回调消息到 OpenClaw Skill
-   * 统一的消息通知机制，支持多种消息类型
+   * v3.12: 只保留 task_completed 回调
    */
   async sendCallback(callbackUrl: string, message: any): Promise<boolean> {
     if (!callbackUrl) {

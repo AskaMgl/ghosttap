@@ -1,4 +1,4 @@
-import { TaskSession, TaskStatus, UiEventMessage, ActionRecord, TaskMetrics } from './types';
+import { SessionContext, TaskStatus, UiEventMessage, ActionRecord, TaskMetrics } from './types';
 import { logger } from './logger';
 import { config } from './config';
 import { dbManager } from './database';
@@ -6,9 +6,15 @@ import { dbManager } from './database';
 /**
  * 会话管理器 - SQLite 持久化存储
  * 负责管理所有任务会话的生命周期
+ * 
+ * v3.12 更新:
+ * - 移除 pending 状态，任务创建直接为 running
+ * - SessionContext 新增 status 字段和 aiCallInFlight 字段
+ * - 添加 latestUiTimestamp 用于过期检测
  */
 export class SessionManager {
-  private activeSessions: Map<string, TaskSession> = new Map(); // 活跃会话缓存
+  private activeSessions: Map<string, SessionContext> = new Map(); // 活跃会话缓存
+  private userSessions: Map<string, string> = new Map(); // user_id -> session_id 映射
   private cleanupInterval: NodeJS.Timeout | null = null;
 
   constructor() {
@@ -20,19 +26,23 @@ export class SessionManager {
 
   /**
    * 创建新会话
+   * v3.12: 任务创建后直接为 running，不再需要 pending 状态
    */
-  createSession(userId: string, goal: string, deviceWs?: WebSocket, callbackUrl?: string): TaskSession {
+  createSession(userId: string, goal: string, deviceWs?: WebSocket, callbackUrl?: string): SessionContext {
     const sessionId = `sess_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
+    const now = Date.now();
     
-    const session: TaskSession = {
+    const session: SessionContext = {
       session_id: sessionId,
       user_id: userId,
       goal,
-      status: 'pending',
+      status: 'running',  // v3.12: 直接为 running，不再有 pending
       device_ws: deviceWs,
       callback_url: callbackUrl,
-      created_at: Date.now(),
-      updated_at: Date.now(),
+      created_at: now,
+      updated_at: now,
+      latestUiTimestamp: 0,  // v3.12: 用于过期检测
+      aiCallInFlight: false, // v3.12: AI调用互斥锁
       history: [],
       metrics: {
         total_tokens: 0,
@@ -45,13 +55,14 @@ export class SessionManager {
     };
 
     this.activeSessions.set(sessionId, session);
+    this.userSessions.set(userId, sessionId);
     
     // 持久化到数据库（异步，不阻塞）
     dbManager.saveSession({
       session_id: sessionId,
       user_id: userId,
       goal,
-      status: 'pending',
+      status: 'running',
       callback_url: callbackUrl,
       created_at: session.created_at,
       updated_at: session.updated_at,
@@ -71,7 +82,7 @@ export class SessionManager {
   /**
    * 更新会话的回调地址
    */
-  updateSessionCallbackUrl(sessionId: string, callbackUrl: string): TaskSession | undefined {
+  updateSessionCallbackUrl(sessionId: string, callbackUrl: string): SessionContext | undefined {
     const session = this.activeSessions.get(sessionId);
     if (!session) return undefined;
 
@@ -94,7 +105,7 @@ export class SessionManager {
   /**
    * 获取会话
    */
-  async getSession(sessionId: string): Promise<TaskSession | undefined> {
+  async getSession(sessionId: string): Promise<SessionContext | undefined> {
     // 先从缓存获取
     if (this.activeSessions.has(sessionId)) {
       return this.activeSessions.get(sessionId);
@@ -104,7 +115,7 @@ export class SessionManager {
     const dbSession = await dbManager.getSession(sessionId);
     if (dbSession) {
       const history = await dbManager.getSessionHistory(sessionId);
-      const session: TaskSession = {
+      const session: SessionContext = {
         session_id: dbSession.session_id,
         user_id: dbSession.user_id,
         goal: dbSession.goal,
@@ -113,6 +124,8 @@ export class SessionManager {
         created_at: dbSession.created_at,
         updated_at: dbSession.updated_at,
         result: dbSession.result,
+        latestUiTimestamp: 0,
+        aiCallInFlight: false,
         history: history.map((h: any) => ({
           step: h.step,
           timestamp: h.timestamp,
@@ -131,8 +144,9 @@ export class SessionManager {
       };
       
       // 如果是活跃状态，加入缓存
-      if (['pending', 'running', 'paused'].includes(session.status)) {
+      if (['running', 'paused'].includes(session.status)) {
         this.activeSessions.set(sessionId, session);
+        this.userSessions.set(session.user_id, sessionId);
       }
       
       return session;
@@ -144,17 +158,19 @@ export class SessionManager {
   /**
    * 同步获取会话（仅从缓存）
    */
-  getSessionSync(sessionId: string): TaskSession | undefined {
+  getSessionSync(sessionId: string): SessionContext | undefined {
     return this.activeSessions.get(sessionId);
   }
 
   /**
    * 获取用户的活跃会话
    */
-  async getUserActiveSession(userId: string): Promise<TaskSession | undefined> {
+  async getUserActiveSession(userId: string): Promise<SessionContext | undefined> {
     // 从缓存中查找
-    for (const session of this.activeSessions.values()) {
-      if (session.user_id === userId && ['pending', 'running', 'paused'].includes(session.status)) {
+    const sessionId = this.userSessions.get(userId);
+    if (sessionId) {
+      const session = this.activeSessions.get(sessionId);
+      if (session && ['running', 'paused'].includes(session.status)) {
         return session;
       }
     }
@@ -171,9 +187,11 @@ export class SessionManager {
   /**
    * 同步获取用户活跃会话（仅从缓存）
    */
-  getUserActiveSessionSync(userId: string): TaskSession | undefined {
-    for (const session of this.activeSessions.values()) {
-      if (session.user_id === userId && ['pending', 'running', 'paused'].includes(session.status)) {
+  getUserActiveSessionSync(userId: string): SessionContext | undefined {
+    const sessionId = this.userSessions.get(userId);
+    if (sessionId) {
+      const session = this.activeSessions.get(sessionId);
+      if (session && ['running', 'paused'].includes(session.status)) {
         return session;
       }
     }
@@ -187,7 +205,7 @@ export class SessionManager {
     sessionId: string, 
     status: TaskStatus, 
     deviceWs?: WebSocket
-  ): TaskSession | undefined {
+  ): SessionContext | undefined {
     const session = this.activeSessions.get(sessionId);
     if (!session) return undefined;
 
@@ -212,14 +230,28 @@ export class SessionManager {
 
   /**
    * 更新UI事件
+   * v3.12: 同时更新 latestUiTimestamp 用于过期检测
    */
-  updateUiEvent(sessionId: string, uiEvent: UiEventMessage): TaskSession | undefined {
+  updateUiEvent(sessionId: string, uiEvent: UiEventMessage): SessionContext | undefined {
     const session = this.activeSessions.get(sessionId);
     if (!session) return undefined;
 
     session.last_ui_event = uiEvent;
+    session.latestUiTimestamp = uiEvent.timestamp;  // v3.12: 更新用于过期检测
     session.updated_at = Date.now();
     
+    return session;
+  }
+
+  /**
+   * 设置AI调用状态
+   * v3.12: 用于 aiCallInFlight 互斥锁
+   */
+  setAiCallInFlight(sessionId: string, inFlight: boolean): SessionContext | undefined {
+    const session = this.activeSessions.get(sessionId);
+    if (!session) return undefined;
+
+    session.aiCallInFlight = inFlight;
     return session;
   }
 
@@ -262,7 +294,7 @@ export class SessionManager {
     sessionId: string,
     inputTokens: number,
     outputTokens: number
-  ): TaskSession | undefined {
+  ): SessionContext | undefined {
     const session = this.activeSessions.get(sessionId);
     if (!session) return undefined;
 
@@ -311,7 +343,11 @@ export class SessionManager {
   /**
    * 结束会话
    */
-  endSession(sessionId: string, status: 'completed' | 'failed' | 'cancelled', result?: string): TaskSession | undefined {
+  endSession(
+    sessionId: string, 
+    status: 'completed' | 'failed' | 'cancelled', 
+    result?: string
+  ): SessionContext | undefined {
     const session = this.activeSessions.get(sessionId);
     if (!session) return undefined;
 
@@ -341,6 +377,7 @@ export class SessionManager {
 
     // 从活跃缓存中移除
     this.activeSessions.delete(sessionId);
+    this.userSessions.delete(session.user_id);
 
     logger.info('Session ended', { 
       session_id: sessionId, 
@@ -356,6 +393,7 @@ export class SessionManager {
 
   /**
    * 清理过期会话
+   * v3.12: 移除 pending 状态相关的超时处理
    */
   private cleanupExpiredSessions(): void {
     const now = Date.now();
@@ -368,13 +406,9 @@ export class SessionManager {
       // 暂停状态超时
       const isPauseExpired = session.status === 'paused' 
         && now - lastActivity > config.pauseTimeout;
-      
-      // 授权等待超时
-      const isAuthExpired = session.status === 'pending' 
-        && now - session.created_at > config.authTimeout;
 
-      if (isExpired || isPauseExpired || isAuthExpired) {
-        const reason = isAuthExpired ? '授权超时' : (isPauseExpired ? '暂停超时' : '任务超时');
+      if (isExpired || isPauseExpired) {
+        const reason = isPauseExpired ? '暂停超时' : '任务超时';
         this.endSession(sessionId, 'cancelled', reason);
       }
     }
@@ -388,6 +422,7 @@ export class SessionManager {
       clearInterval(this.cleanupInterval);
     }
     this.activeSessions.clear();
+    this.userSessions.clear();
   }
 
   /**

@@ -7,23 +7,20 @@ import { logger } from './logger';
  * 设计原则：手机端已完成基础过滤（只上报可交互元素），
  * 云端只做格式转换，不做复杂压缩
  * 
- * 改进点：
- * - 增加了更全面的敏感操作检测
- * - 添加了更多日志记录点
- * - 优化了文本截断逻辑
- * - 增加了元素去重检测
+ * v3.12 更新:
+ * - 敏感词检测对齐设计文档第一层检测
+ * - UI格式添加软键盘状态显示
  */
 export class UiFormatter {
-  // 敏感操作关键词配置（可扩展）
+  // v3.12: 第一层硬编码敏感词（精确匹配，不可配置绕过）
+  // 这些关键词会在调用AI之前被检测，零成本、零延迟
   private static readonly SENSITIVE_KEYWORDS = [
-    { keywords: ['支付', '付款', '确认支付', '立即支付', 'pay', 'payment', 'purchase'], type: '支付' },
-    { keywords: ['密码', '安全验证', '指纹验证', 'password', 'verification', 'verify', '认证'], type: '密码' },
-    { keywords: ['确认付款', '立即付款', 'confirm payment'], type: '付款确认' },
-    { keywords: ['转账', '汇款', 'transfer', 'send money'], type: '转账' },
-    { keywords: ['充值', 'top up', 'recharge'], type: '充值' },
-    { keywords: ['提现', 'withdraw'], type: '提现' },
-    { keywords: ['绑定银行卡', '添加银行卡', 'bank card'], type: '银行卡绑定' },
-    { keywords: ['短信验证码', '手机验证码', 'sms code', 'verification code'], type: '验证码' },
+    // 支付相关
+    '支付', '付款', '确认支付', '立即支付',
+    // 密码相关  
+    '密码', '安全验证', '指纹验证',
+    // 金额相关（配合上下文检测）
+    '确认付款', '立即付款',
   ];
 
   // 加载状态关键词
@@ -119,6 +116,7 @@ export class UiFormatter {
 
   /**
    * 将UI事件转换为AI可读的文本格式
+   * v3.12: 添加软键盘状态显示
    */
   static formatForAi(uiEvent: UiEventMessage): string {
     const { package: pkg, activity, screen, elements, stats } = uiEvent;
@@ -133,6 +131,13 @@ export class UiFormatter {
     if (activity) {
       lines.push(`Activity: ${activity}`);
     }
+    
+    // v3.12: 添加软键盘状态（仅在键盘可见时显示）
+    if (screen.keyboard_visible) {
+      const keyboardBottom = 100 - screen.keyboard_height;
+      lines.push(`键盘: 可见, 占屏幕 ${screen.keyboard_height.toFixed(1)}%（y > ${keyboardBottom.toFixed(1)}% 的区域被遮挡）`);
+    }
+    
     lines.push('');
     
     // 元素列表
@@ -182,104 +187,62 @@ export class UiFormatter {
   }
 
   /**
-   * 检测敏感操作关键词
-   * 根据设计文档：基于UI内容检测，比Package白名单更精准
+   * 第一层敏感词检测（代码硬检测）
+   * v3.12: 对齐设计文档，调用AI之前执行，零成本、零延迟、不可绕过
    * 
-   * 改进：使用更全面的关键词库，支持中英文
+   * 检测规则：
+   * 1. 支付相关关键词精确匹配
+   * 2. 密码相关关键词精确匹配
+   * 3. 金额相关：包含"¥"或"元"且同屏出现"确认"/"支付"/"付款"
    */
-  static detectSensitiveOperations(uiEvent: UiEventMessage): { isSensitive: boolean; reason?: string; confidence: 'high' | 'medium' | 'low' } {
-    const detectedKeywords: Array<{ type: string; text: string; elementId: number }> = [];
+  static detectSensitiveOperations(uiEvent: UiEventMessage): { 
+    isSensitive: boolean; 
+    reason?: string;
+  } {
+    const elements = uiEvent.elements;
     
-    // 检查元素文本
-    for (const element of uiEvent.elements) {
+    // 检查元素文本（精确匹配第一层关键词）
+    for (const element of elements) {
       const text = (element.text || element.desc || '').toLowerCase();
-      
       if (!text) continue;
       
-      for (const { keywords, type } of this.SENSITIVE_KEYWORDS) {
-        if (keywords.some(kw => text.includes(kw.toLowerCase()))) {
-          detectedKeywords.push({ type, text: element.text || element.desc || '', elementId: element.id });
-          logger.info('Sensitive keyword detected', { 
+      // 精确匹配第一层关键词
+      for (const keyword of this.SENSITIVE_KEYWORDS) {
+        if (text.includes(keyword.toLowerCase())) {
+          logger.info('Sensitive keyword detected (first layer)', { 
             element_id: element.id, 
             text: element.text,
-            type 
-          });
-        }
-      }
-      
-      // 检查金额相关（包含 ¥ 或 元 或 $）
-      const hasCurrencySymbol = text.includes('¥') || text.includes('元') || text.includes('$') || text.includes('€');
-      const hasNumber = /\d/.test(text);
-      
-      // 检测支付按钮或金额确认（高置信度）
-      if (hasCurrencySymbol && hasNumber) {
-        // 检查是否同时包含支付相关词
-        const paymentWords = ['支付', '付款', '购买', '充值', '转账', 'pay', 'purchase', 'buy', 'checkout'];
-        const hasPaymentWord = paymentWords.some(word => text.includes(word.toLowerCase()));
-        
-        if (hasPaymentWord) {
-          logger.info('Payment amount with action detected', { 
-            element_id: element.id, 
-            text: element.text,
-            confidence: 'high'
+            keyword 
           });
           return { 
             isSensitive: true, 
-            reason: `检测到支付金额: ${element.text}`,
-            confidence: 'high'
+            reason: `检测到敏感操作: ${keyword}${element.text ? ` (${element.text})` : ''}`
           };
-        } else {
-          // 仅金额但无明显支付动作（中等置信度）
-          detectedKeywords.push({ 
-            type: '金额', 
-            text: element.text || '', 
-            elementId: element.id 
-          });
         }
       }
-    }
-
-    // 根据检测结果返回
-    if (detectedKeywords.length > 0) {
-      // 按优先级排序
-      const highPriorityTypes = ['支付', '密码', '付款确认', '转账'];
-      const highPriorityMatches = detectedKeywords.filter(d => highPriorityTypes.includes(d.type));
       
-      if (highPriorityMatches.length > 0) {
-        const match = highPriorityMatches[0];
+      // 检测金额 + 支付上下文
+      const hasCurrencySymbol = text.includes('¥') || text.includes('元') || text.includes('￥');
+      const hasPaymentContext = text.includes('确认') || text.includes('支付') || 
+                                text.includes('付款') || text.includes('购买');
+      
+      if (hasCurrencySymbol && hasPaymentContext) {
+        logger.info('Payment amount detected (first layer)', { 
+          element_id: element.id, 
+          text: element.text 
+        });
         return { 
           isSensitive: true, 
-          reason: `检测到${match.type}相关操作: ${match.text}`,
-          confidence: 'high'
+          reason: `检测到支付金额: ${element.text}`
         };
       }
-      
-      // 多个中低优先级关键词组合也视为敏感
-      if (detectedKeywords.length >= 2) {
-        const types = [...new Set(detectedKeywords.map(d => d.type))];
-        return { 
-          isSensitive: true, 
-          reason: `检测到多个敏感操作关键词: ${types.join(', ')}`,
-          confidence: 'medium'
-        };
-      }
-      
-      // 单个中低优先级
-      const match = detectedKeywords[0];
-      return { 
-        isSensitive: true, 
-        reason: `检测到${match.type}相关操作: ${match.text}`,
-        confidence: 'low'
-      };
     }
 
-    return { isSensitive: false, confidence: 'low' };
+    return { isSensitive: false };
   }
 
   /**
    * 检查是否处于加载状态
-   * 
-   * 改进：增加了更多加载状态检测，包括骨架屏检测
    */
   static isLoadingState(uiEvent: UiEventMessage): { isLoading: boolean; reason?: string } {
     // 检查是否有加载相关的文本
