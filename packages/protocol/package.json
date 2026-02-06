@@ -1,0 +1,15 @@
+{
+  "name": "@ghosttap/protocol",
+  "version": "0.1.0",
+  "description": "GhostTap 共享协议定义",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "scripts": {
+    "build": "tsc",
+    "dev": "tsc --watch"
+  },
+  "devDependencies": {
+    "typescript": "^5.3.3"
+  },
+  "license": "MIT"
+}

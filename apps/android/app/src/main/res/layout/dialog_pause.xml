@@ -1,0 +1,42 @@
+<?xml version="1.0" encoding="utf-8"?>
+<LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    android:layout_width="match_parent"
+    android:layout_height="wrap_content"
+    android:orientation="vertical"
+    android:padding="20dp">
+
+    <TextView
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:text="任务已暂停，需要您手动完成以下操作："
+        android:textSize="16sp"
+        android:layout_marginBottom="12dp" />
+
+    <TextView
+        android:id="@+id/tv_pause_reason"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:text="检测到敏感操作"
+        android:textSize="14sp"
+        android:textStyle="bold"
+        android:textColor="#FF9800"
+        android:padding="12dp"
+        android:background="#FFF3E0"
+        android:layout_marginBottom="16dp" />
+
+    <TextView
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:text="完成操作后，点击继续按钮恢复 AI 控制。"
+        android:textSize="14sp"
+        android:alpha="0.7"
+        android:layout_marginBottom="16dp" />
+
+    <Button
+        android:id="@+id/btn_resume"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:text="继续任务"
+        android:backgroundTint="#4CAF50" />
+
+</LinearLayout>

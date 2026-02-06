@@ -1,0 +1,4 @@
+<resources>
+    <string name="app_name">GhostTap</string>
+    <string name="accessibility_service_description">GhostTap 需要无障碍权限来采集界面信息并执行自动化操作。所有操作都在您的授权下进行，敏感操作会自动暂停等待您确认。</string>
+</resources>

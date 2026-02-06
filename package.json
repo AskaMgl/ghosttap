@@ -1,0 +1,18 @@
+{
+  "name": "@ghosttap/root",
+  "version": "0.1.0",
+  "private": true,
+  "description": "GhostTap - AI驱动的Android远程控制",
+  "scripts": {
+    "dev:server": "cd apps/server && npm run dev",
+    "build:server": "cd apps/server && npm run build",
+    "start:server": "cd apps/server && npm start",
+    "build:protocol": "cd packages/protocol && npm run build",
+    "install:all": "npm install && cd apps/server && npm install && cd ../../packages/protocol && npm install"
+  },
+  "workspaces": [
+    "apps/*",
+    "packages/*"
+  ],
+  "license": "MIT"
+}
