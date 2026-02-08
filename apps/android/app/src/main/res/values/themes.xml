@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- Base theme -->
+    <style name="Theme.GhostTap" parent="android:Theme.Material.Light.NoActionBar">
+        <item name="android:windowBackground">@android:color/white</item>
+        <item name="android:colorPrimary">#00AA00</item>
+        <item name="android:colorPrimaryDark">#008800</item>
+        <item name="android:colorAccent">#00AA00</item>
+    </style>
+
+    <!-- Day/Night theme alias -->
+    <style name="Theme.Material3.DayNight.NoActionBar" parent="Theme.GhostTap" />
+</resources>

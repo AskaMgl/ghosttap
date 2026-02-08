@@ -5,6 +5,8 @@ import android.accessibilityservice.AccessibilityServiceInfo;
 import android.app.Notification;
 import android.app.NotificationChannel;
 import android.app.NotificationManager;
+import android.app.PendingIntent;
+import android.content.Intent;
 import android.content.SharedPreferences;
 import android.graphics.Point;
 import android.os.Build;
@@ -91,7 +93,20 @@ public class GhostTapService extends AccessibilityService implements
     }
     
     /**
-     * v3.12: 启动前台服务
+     * v3.14: 处理通知按钮点击
+     */
+    @Override
+    public int onStartCommand(Intent intent, int flags, int startId) {
+        if (intent != null && "STOP_SERVICE".equals(intent.getAction())) {
+            Log.i(TAG, "Stop service requested from notification");
+            stopCurrentTask();
+            stopSelf();
+        }
+        return super.onStartCommand(intent, flags, startId);
+    }
+    
+    /**
+     * v3.14: 启动前台服务，带停止按钮
      */
     private void startForegroundService() {
         // 创建通知渠道（Android O+）
@@ -108,6 +123,13 @@ public class GhostTapService extends AccessibilityService implements
             }
         }
         
+        // 创建停止服务的 PendingIntent
+        Intent stopIntent = new Intent(this, GhostTapService.class);
+        stopIntent.setAction("STOP_SERVICE");
+        PendingIntent stopPendingIntent = PendingIntent.getService(
+            this, 0, stopIntent, PendingIntent.FLAG_IMMUTABLE
+        );
+        
         // 创建通知
         Notification.Builder builder;
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
@@ -121,6 +143,7 @@ public class GhostTapService extends AccessibilityService implements
             .setContentText("AI 远程控制服务正在运行")
             .setSmallIcon(android.R.drawable.ic_menu_compass)  // 使用系统图标
             .setOngoing(true)
+            .addAction(android.R.drawable.ic_menu_close_clear_cancel, "停止服务", stopPendingIntent)
             .build();
         
         // 启动前台服务
@@ -137,40 +160,50 @@ public class GhostTapService extends AccessibilityService implements
         
         Log.i(TAG, "GhostTap service connected");
         
-        // 设置服务信息
-        AccessibilityServiceInfo info = new AccessibilityServiceInfo();
-        info.eventTypes = AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED |
-                          AccessibilityEvent.TYPE_WINDOW_CONTENT_CHANGED |
-                          AccessibilityEvent.TYPE_VIEW_CLICKED |
-                          AccessibilityEvent.TYPE_VIEW_FOCUSED;
-        info.feedbackType = AccessibilityServiceInfo.FEEDBACK_GENERIC;
-        info.notificationTimeout = 100;
-        // v3.12: 添加 flagRetrieveInteractiveWindows 用于软键盘检测
-        info.flags = AccessibilityServiceInfo.FLAG_REPORT_VIEW_IDS |
-                     AccessibilityServiceInfo.FLAG_RETRIEVE_INTERACTIVE_WINDOWS;
-        setServiceInfo(info);
-        
-        // 获取屏幕尺寸
-        updateScreenSize();
-        
-        // 初始化组件
-        String userId = getUserId();
-        Config.setUserId(userId);
-        
-        webSocketManager = new WebSocketManager(this, this, this);
-        uiCollector = new AccessibilityCollector();
-        commandExecutor = new CommandExecutor(this);
-        floatWindowManager = new FloatWindowManager(this);
-        floatWindowManager.setPauseCallback(this);
-        
-        // v3.12: 连接 WebSocket（传递 device_name）
-        webSocketManager.connect(userId, Config.DEVICE_NAME);
-        
-        // 设置实例
-        instance = this;
-        isRunning = true;
-        
-        Log.i(TAG, "GhostTap service initialized, userId: " + userId);
+        try {
+            // 设置服务信息
+            AccessibilityServiceInfo info = new AccessibilityServiceInfo();
+            info.eventTypes = AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED |
+                              AccessibilityEvent.TYPE_WINDOW_CONTENT_CHANGED |
+                              AccessibilityEvent.TYPE_VIEW_CLICKED |
+                              AccessibilityEvent.TYPE_VIEW_FOCUSED;
+            info.feedbackType = AccessibilityServiceInfo.FEEDBACK_GENERIC;
+            info.notificationTimeout = 100;
+            // v3.12: 添加 flagRetrieveInteractiveWindows 用于软键盘检测
+            info.flags = AccessibilityServiceInfo.FLAG_REPORT_VIEW_IDS |
+                         AccessibilityServiceInfo.FLAG_RETRIEVE_INTERACTIVE_WINDOWS;
+            setServiceInfo(info);
+            
+            // 获取屏幕尺寸
+            updateScreenSize();
+            
+            // 初始化组件
+            String userId = getUserId();
+            String deviceName = getDeviceName();
+            String serverUrl = getServerUrl();  // v3.14: 读取服务器地址
+            Log.i(TAG, "Initializing with serverUrl: " + serverUrl + ", userId: " + userId);
+            
+            Config.setUserId(userId);
+            Config.setDeviceName(deviceName);
+            
+            webSocketManager = new WebSocketManager(this, this, this);
+            uiCollector = new AccessibilityCollector();
+            commandExecutor = new CommandExecutor(this);
+            floatWindowManager = new FloatWindowManager(this);
+            floatWindowManager.setPauseCallback(this);
+            
+            // v3.14: 连接 WebSocket（传递 device_name 和 server_url）
+            webSocketManager.connect(userId, deviceName, serverUrl);
+            
+            // 设置实例
+            instance = this;
+            isRunning = true;
+            
+            Log.i(TAG, "GhostTap service initialized, userId: " + userId);
+        } catch (Exception e) {
+            Log.e(TAG, "Error in onServiceConnected", e);
+            throw e;  // 重新抛出以便看到堆栈跟踪
+        }
     }
     
     /**
@@ -230,6 +263,9 @@ public class GhostTapService extends AccessibilityService implements
         super.onDestroy();
         
         Log.i(TAG, "GhostTap service destroying...");
+        
+        // 停止前台服务
+        stopForeground(true);
         
         // 清理资源
         isRunning = false;
@@ -557,14 +593,19 @@ public class GhostTapService extends AccessibilityService implements
     
     /**
      * v3.12: 采集并发送当前 UI
+     * v3.13: 使用 getApplicationWindowRoot 过滤 OVERLAY 窗口
      */
     public void reportCurrentUi() {
         if (!webSocketManager.isConnected() || currentSessionId == null) {
             return;
         }
         
-        AccessibilityNodeInfo root = getRootInActiveWindow();
-        if (root == null) return;
+        // v3.13: 使用应用程序窗口根节点，过滤系统覆盖层
+        AccessibilityNodeInfo root = uiCollector.getApplicationWindowRoot(this);
+        if (root == null) {
+            Log.w(TAG, "No application window root found");
+            return;
+        }
         
         String packageName = root.getPackageName() != null ? root.getPackageName().toString() : "";
         String className = root.getClassName() != null ? root.getClassName().toString() : "";
@@ -631,6 +672,33 @@ public class GhostTapService extends AccessibilityService implements
     }
     
     /**
+     * v3.14: 获取设备名称（支持持久化，默认使用系统设备名）
+     */
+    private String getDeviceName() {
+        SharedPreferences prefs = getSharedPreferences(Config.PREFS_NAME, MODE_PRIVATE);
+        String deviceName = prefs.getString(Config.PREF_DEVICE_NAME, null);
+        
+        // v3.14: 如果从未保存过，或保存的是旧版本默认值"安卓设备"，更新为系统设备名
+        if (deviceName == null || deviceName.equals("Android设夁")) {
+            deviceName = Config.getDefaultDeviceName();
+            // 保存到 SharedPreferences
+            prefs.edit().putString(Config.PREF_DEVICE_NAME, deviceName).apply();
+        }
+        
+        return deviceName;
+    }
+    
+    /**
+     * v3.14: 获取服务器地址
+     */
+    private String getServerUrl() {
+        SharedPreferences prefs = getSharedPreferences(Config.PREFS_NAME, MODE_PRIVATE);
+        String url = prefs.getString(Config.PREF_SERVER_URL, Config.SERVER_URL);
+        Log.d(TAG, "getServerUrl: " + url);
+        return url;
+    }
+    
+    /**
      * 获取当前任务状态
      */
     public TaskStatus getCurrentStatus() {
@@ -646,9 +714,10 @@ public class GhostTapService extends AccessibilityService implements
     
     /**
      * 检查服务是否运行中
+     * 同时检查实例是否存在，防止服务崩溃后状态不一致
      */
     public static boolean isRunning() {
-        return isRunning;
+        return isRunning && instance != null;
     }
     
     /**
@@ -656,6 +725,13 @@ public class GhostTapService extends AccessibilityService implements
      */
     public static GhostTapService getInstance() {
         return instance;
+    }
+    
+    /**
+     * 检查 WebSocket 是否已连接
+     */
+    public boolean isWebSocketConnected() {
+        return webSocketManager != null && webSocketManager.isConnected();
     }
     
     /**

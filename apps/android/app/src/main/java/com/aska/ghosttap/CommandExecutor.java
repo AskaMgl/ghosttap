@@ -363,7 +363,7 @@ public class CommandExecutor {
      * 
      * @param waitMs 等待毫秒数
      */
-    public void wait(long waitMs) {
+    public void waitMs(long waitMs) {
         if (waitMs <= 0) return;
         
         try {
@@ -373,24 +373,4 @@ public class CommandExecutor {
         }
     }
     
-    /**
-     * 执行最近任务操作
-     */
-    public boolean recentApps() {
-        return service.performGlobalAction(AccessibilityService.GLOBAL_ACTION_RECENTS);
-    }
-    
-    /**
-     * 执行通知栏操作
-     */
-    public boolean notifications() {
-        return service.performGlobalAction(AccessibilityService.GLOBAL_ACTION_NOTIFICATIONS);
-    }
-    
-    /**
-     * 执行快捷设置操作
-     */
-    public boolean quickSettings() {
-        return service.performGlobalAction(AccessibilityService.GLOBAL_ACTION_QUICK_SETTINGS);
-    }
 }

@@ -17,6 +17,7 @@ import {
   ErrorEvent,
   SessionContext,
   TaskResume,
+  ClientInfo,
 } from './types';
 
 /**
@@ -65,6 +66,13 @@ export class WebSocketGateway {
       if (!userId) {
         logger.warn('Connection rejected: missing user_id');
         ws.close(1002, 'Missing user_id parameter');
+        return;
+      }
+
+      // v3.12: 白名单验证
+      if (!config.allowedUserIds.has(userId)) {
+        logger.warn('Connection rejected: user_id not in whitelist', { user_id: userId });
+        ws.close(1002, 'Invalid user_id');
         return;
       }
 
@@ -146,29 +154,27 @@ export class WebSocketGateway {
   }
 
   /**
-   * v3.12: 断连恢复处理
-   * 如果有running/paused状态的任务，发送TaskResume
+   * v3.14: 断连恢复处理
+   * 检查是否在宽限期内，如果是则恢复任务
    */
   private async handleReconnectResume(userId: string, ws: WebSocket): Promise<void> {
-    const activeSession = sessionManager.getUserActiveSessionSync(userId);
+    // v3.14: 使用新的 handleDeviceReconnect 方法处理重连
+    const session = sessionManager.handleDeviceReconnect(userId, ws as any);
     
-    if (activeSession && (activeSession.status === 'running' || activeSession.status === 'paused')) {
+    if (session && (session.status === 'running' || session.status === 'paused')) {
       logger.info('Resuming task after reconnect', { 
-        session_id: activeSession.session_id,
+        session_id: session.session_id,
         user_id: userId,
-        status: activeSession.status
+        status: session.status
       });
-      
-      // 更新会话的设备连接
-      sessionManager.updateSessionStatus(activeSession.session_id, activeSession.status, ws as any);
       
       // 发送 TaskResume 消息
       const resumeMsg: TaskResume = {
         type: 'task_resume',
-        session_id: activeSession.session_id,
-        goal: activeSession.goal,
-        status: activeSession.status,
-        reason: activeSession.status === 'paused' ? '用户暂停' : undefined,
+        session_id: session.session_id,
+        goal: session.goal,
+        status: session.status,
+        reason: session.status === 'paused' ? '用户暂停' : undefined,
       };
       
       this.send(ws, resumeMsg);
@@ -406,13 +412,41 @@ export class WebSocketGateway {
 
     } catch (error) {
       logger.error('AI decision failed', error, { session_id: session.session_id });
-      // 发送等待指令
-      this.send(ws, {
-        type: 'action',
-        action: 'wait',
-        wait_ms: 2000,
-        reason: 'AI决策出错，等待重试',
-      });
+      
+      // v3.13: 记录 AI 失败并检查是否应该暂停任务
+      const shouldPause = sessionManager.recordAiFailure(session.session_id);
+      
+      if (shouldPause) {
+        // 连续3次失败，暂停任务并通知用户
+        sessionManager.updateSessionStatus(session.session_id, 'paused');
+        this.send(ws, {
+          type: 'action',
+          action: 'pause',
+          reason: 'AI服务连续不可用，任务已暂停，请检查AI配置后点击继续',
+        });
+        
+        // 通过回调通知用户
+        if (session.callback_url) {
+          await httpApi.sendCallback(session.callback_url, {
+            type: 'task_completed',
+            user_id: session.user_id,
+            session_id: session.session_id,
+            status: 'paused',
+            result: 'AI服务暂时不可用，任务已暂停',
+            goal: session.goal,
+            steps: session.history.length,
+            cost_usd: session.metrics.cost_usd,
+          });
+        }
+      } else {
+        // 发送等待指令，稍后重试
+        this.send(ws, {
+          type: 'action',
+          action: 'wait',
+          wait_ms: 2000,
+          reason: 'AI决策出错，等待重试',
+        });
+      }
     } finally {
       // 释放AI调用锁
       sessionManager.setAiCallInFlight(session.session_id, false);
@@ -518,8 +552,8 @@ export class WebSocketGateway {
       
       logger.info('Device disconnected', { user_id: clientInfo.user_id });
       
-      // v3.12: 不立即标记任务失败，给断连宽限期
-      // 任务超时检查由 session-manager 的 cleanupExpiredSessions 处理
+      // v3.14: 处理设备断开，启动断连宽限期（30秒）
+      sessionManager.handleDeviceDisconnect(clientInfo.user_id);
     }
     this.clients.delete(ws);
   }
@@ -656,15 +690,8 @@ export class WebSocketGateway {
     }
     this.clients.clear();
     this.userConnections.clear();
+    logger.info('WebSocket server stopped');
   }
-}
-
-interface ClientInfo {
-  ws: WebSocket;
-  user_id: string;
-  device_name: string;
-  lastPing: number;
-  isAuthenticated: boolean;
 }
 
 // 导出单例

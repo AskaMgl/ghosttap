@@ -302,6 +302,58 @@ export class DatabaseManager {
   }
 
   /**
+   * 清理过期会话数据（v3.13: 设计文档要求保留30天）
+   * 删除30天前的已结束会话及其动作历史
+   */
+  async cleanupExpiredSessions(retentionDays: number = 30): Promise<number> {
+    if (!this.db) return 0;
+
+    const cutoffTime = Date.now() - (retentionDays * 24 * 60 * 60 * 1000);
+    
+    try {
+      // 先获取要删除的会话ID（用于日志）
+      const sessionsToDelete = await this.db.all(
+        `SELECT session_id FROM sessions 
+         WHERE status IN ('completed', 'failed', 'cancelled') 
+         AND updated_at < ?`,
+        cutoffTime
+      );
+      
+      const count = sessionsToDelete.length;
+      
+      if (count > 0) {
+        // 使用事务删除会话（动作历史会通过外键级联删除）
+        await this.db.run('BEGIN TRANSACTION');
+        
+        for (const session of sessionsToDelete) {
+          await this.db.run(
+            'DELETE FROM action_history WHERE session_id = ?',
+            session.session_id
+          );
+          await this.db.run(
+            'DELETE FROM sessions WHERE session_id = ?',
+            session.session_id
+          );
+        }
+        
+        await this.db.run('COMMIT');
+        
+        logger.info('Cleaned up expired sessions', { 
+          count, 
+          retention_days: retentionDays,
+          cutoff_time: new Date(cutoffTime).toISOString()
+        });
+      }
+      
+      return count;
+    } catch (error) {
+      await this.db.run('ROLLBACK');
+      logger.error('Failed to cleanup expired sessions', error);
+      return 0;
+    }
+  }
+
+  /**
    * 关闭数据库
    */
   async close(): Promise<void> {

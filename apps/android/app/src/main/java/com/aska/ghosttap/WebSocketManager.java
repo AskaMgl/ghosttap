@@ -17,7 +17,7 @@ import okhttp3.WebSocketListener;
 import okhttp3.logging.HttpLoggingInterceptor;
 
 /**
- * WebSocket 连接管理器 (v3.12)
+ * WebSocket 连接管理器 (v3.14)
  * 
  * 职责：
  * 1. 通过 URL query 参数进行连接认证
@@ -49,6 +49,7 @@ public class WebSocketManager {
     private long retryDelay = 1000L;
     
     private Thread reconnectThread;
+    private Runnable heartbeatRunnable;  // 心跳任务引用，用于精确取消
     
     private final OnConnectedCallback onConnected;
     private final OnDisconnectedCallback onDisconnected;
@@ -91,11 +92,22 @@ public class WebSocketManager {
     }
     
     /**
-     * 连接到 WebSocket 服务器 (v3.12: URL query 参数认证)
+     * 连接到 WebSocket 服务器 (v3.14: 自动使用系统设备名称)
      */
-    public void connect(String userId, String deviceName) {
+    public void connect(String userId, String deviceName, String serverUrl) {
+        Log.i(TAG, "Connecting to WebSocket: userId=" + userId + ", serverUrl=" + serverUrl);
+        
+        if (userId == null || userId.isEmpty()) {
+            Log.e(TAG, "Cannot connect: userId is empty");
+            return;
+        }
+        
         this.userId = userId;
-        this.deviceName = deviceName != null ? deviceName : "Android设备";
+        this.currentServerUrl = serverUrl;
+        // v3.14: 如果未指定设备名，使用系统设备名
+        this.deviceName = (deviceName != null && !deviceName.isEmpty()) 
+            ? deviceName 
+            : Config.getDefaultDeviceName();
         
         if (isConnected) {
             Log.w(TAG, "Already connected");
@@ -104,12 +116,16 @@ public class WebSocketManager {
         
         shouldReconnect = true;
         
-        // v3.12: 通过 URL query 参数传递认证信息
-        String wsUrl = Config.SERVER_URL + "?user_id=" + userId + "&device_name=" + deviceName;
-        
-        Request request = new Request.Builder()
-            .url(wsUrl)
-            .build();
+        try {
+            // v3.14: 使用用户配置的服务器地址，默认使用 Config.SERVER_URL
+            String baseUrl = (serverUrl != null && !serverUrl.isEmpty()) ? serverUrl : Config.SERVER_URL;
+            // v3.12: 通过 URL query 参数传递认证信息
+            String wsUrl = baseUrl + "?user_id=" + userId + "&device_name=" + this.deviceName;
+            Log.i(TAG, "WebSocket URL: " + wsUrl);
+            
+            Request request = new Request.Builder()
+                .url(wsUrl)
+                .build();
         
         webSocket = client.newWebSocket(request, new WebSocketListener() {
             @Override
@@ -152,14 +168,19 @@ public class WebSocketManager {
                 handleDisconnect();
             }
         });
+        } catch (Exception e) {
+            Log.e(TAG, "Failed to create WebSocket connection", e);
+        }
     }
     
     /**
-     * 重载：使用默认设备名称
+     * 重载：使用默认设备名称和默认服务器地址
      */
     public void connect(String userId) {
-        connect(userId, Config.DEVICE_NAME);
+        connect(userId, Config.getDeviceName(), Config.SERVER_URL);
     }
+    
+    private String currentServerUrl;  // 保存当前服务器地址用于重连
     
     /**
      * 断开连接
@@ -274,9 +295,9 @@ public class WebSocketManager {
     private void startHeartbeat() {
         // 立即发送第一个ping
         sendPing();
-        
+
         // 定时发送后续ping
-        Runnable heartbeatRunnable = new Runnable() {
+        heartbeatRunnable = new Runnable() {
             @Override
             public void run() {
                 if (isConnected) {
@@ -285,16 +306,19 @@ public class WebSocketManager {
                 }
             }
         };
-        
+
         handler.postDelayed(heartbeatRunnable, HEARTBEAT_INTERVAL_MS);
     }
-    
+
     /**
      * 停止心跳
      */
     private void stopHeartbeat() {
-        // 移除所有待执行的runnable
-        handler.removeCallbacksAndMessages(null);
+        // 精确取消心跳任务，避免影响其他 Handler 消息
+        if (heartbeatRunnable != null) {
+            handler.removeCallbacks(heartbeatRunnable);
+            heartbeatRunnable = null;
+        }
     }
     
     /**
@@ -332,7 +356,8 @@ public class WebSocketManager {
                     retryDelay = Math.min(retryDelay * 2, MAX_RETRY_DELAY_MS);
                     
                     if (shouldReconnect && !isConnected) {
-                        handler.post(() -> connect(userId, deviceName));
+                        // v3.14: 使用保存的服务器地址进行重连
+                        handler.post(() -> connect(userId, deviceName, currentServerUrl));
                         return;  // connect会创建新的WebSocket，退出循环
                     }
                 } catch (InterruptedException e) {

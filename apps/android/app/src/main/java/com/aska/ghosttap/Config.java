@@ -1,7 +1,9 @@
 package com.aska.ghosttap;
 
+import android.os.Build;
+
 /**
- * GhostTap 配置文件 (v3.12)
+ * GhostTap 配置文件 (v3.14)
  * 
  * 包含服务端连接配置、心跳间隔、重连策略等常量
  */
@@ -11,15 +13,10 @@ public class Config {
     
     /**
      * WebSocket 服务器地址
-     * 使用 wss:// 进行加密传输
-     * v3.12: 认证信息通过 URL query 参数传递，不在 URL 中硬编码
+     * v3.14: MVP 阶段使用 ws:// (明文)，生产环境建议使用 wss:// (加密)
+     * 认证信息通过 URL query 参数传递，不在 URL 中硬编码
      */
-    public static final String SERVER_URL = "wss://your-server.com/ws";
-    
-    /**
-     * HTTP API 基础地址（用于获取配置等）
-     */
-    public static final String API_BASE_URL = "https://your-server.com";
+    public static final String SERVER_URL = "ws://your-server.com:8080";
     
     // ========== 用户配置 ==========
     
@@ -30,10 +27,34 @@ public class Config {
     private static String USER_ID = "";
     
     /**
-     * 设备名称（用于显示）
-     * v3.12: 连接时上报给服务器
+     * 默认设备名称（用于显示）
+     * v3.14: 自动读取系统设备名称
      */
-    public static String DEVICE_NAME = "Android设备";
+    public static String getDefaultDeviceName() {
+        String manufacturer = Build.MANUFACTURER;
+        String model = Build.MODEL;
+        
+        // 移除大小写重复（如 "Xiaomi 22041211AC" 不需要变更）
+        if (model.toLowerCase().startsWith(manufacturer.toLowerCase())) {
+            return capitalize(model);
+        }
+        
+        return capitalize(manufacturer) + " " + model;
+    }
+    
+    /**
+     * 首字母大写
+     */
+    private static String capitalize(String str) {
+        if (str == null || str.isEmpty()) return str;
+        return str.substring(0, 1).toUpperCase() + str.substring(1).toLowerCase();
+    }
+    
+    /**
+     * 设备名称（运行时缓存）
+     * v3.14: 默认使用系统设备名
+     */
+    private static String DEVICE_NAME = null;  // 懒加载，等待 getDefaultDeviceName()
     
     // ========== 心跳配置 (v3.12: 90秒间隔) ==========
     
@@ -43,24 +64,7 @@ public class Config {
      */
     public static final long HEARTBEAT_INTERVAL = 90 * 1000L;
     
-    /**
-     * 心跳超时时间（毫秒）
-     * 超过此时间未收到 pong 则认为连接断开
-     */
-    public static final long HEARTBEAT_TIMEOUT = 5 * 60 * 1000L;
-    
     // ========== 重连配置 ==========
-    
-    /**
-     * 基础重连延迟（毫秒）
-     * 使用指数退避：delay = baseDelay * 2^attempt
-     */
-    public static final long RECONNECT_BASE_DELAY = 1000L;
-    
-    /**
-     * 最大重连延迟（毫秒）
-     */
-    public static final long RECONNECT_MAX_DELAY = 60000L;
     
     /**
      * UI 事件上报防抖时间（毫秒）
@@ -131,5 +135,25 @@ public class Config {
      */
     public static void setUserId(String userId) {
         USER_ID = userId;
+    }
+    
+    /**
+     * v3.14: 获取设备名称
+     * 如果没有设置过，返回系统设备名
+     */
+    public static String getDeviceName() {
+        if (DEVICE_NAME == null) {
+            DEVICE_NAME = getDefaultDeviceName();
+        }
+        return DEVICE_NAME;
+    }
+    
+    /**
+     * v3.14: 设置设备名称
+     */
+    public static void setDeviceName(String deviceName) {
+        DEVICE_NAME = deviceName != null && !deviceName.isEmpty() 
+            ? deviceName 
+            : getDefaultDeviceName();
     }
 }

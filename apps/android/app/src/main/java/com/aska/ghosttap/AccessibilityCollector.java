@@ -149,6 +149,82 @@ public class AccessibilityCollector {
     }
     
     /**
+     * v3.13: 获取应用程序窗口的根节点（过滤系统覆盖层）
+     * 
+     * 设计文档要求: 优先采集 TYPE_APPLICATION 类型窗口，
+     * 忽略 TYPE_ACCESSIBILITY_OVERLAY 类型窗口，避免其他 APP 悬浮窗干扰
+     * 
+     * @param service AccessibilityService
+     * @return 应用程序窗口的根节点，如果没有则返回 null
+     */
+    public AccessibilityNodeInfo getApplicationWindowRoot(AccessibilityService service) {
+        if (service == null) {
+            return null;
+        }
+        
+        try {
+            List<AccessibilityWindowInfo> windows = service.getWindows();
+            if (windows == null || windows.isEmpty()) {
+                return service.getRootInActiveWindow();
+            }
+            
+            // 优先查找 TYPE_APPLICATION 窗口
+            AccessibilityWindowInfo appWindow = null;
+            AccessibilityWindowInfo activeWindow = null;
+            
+            for (AccessibilityWindowInfo window : windows) {
+                int type = window.getType();
+                
+                // 忽略系统覆盖层和其他应用的悬浮窗
+                if (type == AccessibilityWindowInfo.TYPE_ACCESSIBILITY_OVERLAY) {
+                    if (Config.DEBUG_MODE) {
+                        Log.d(TAG, "Skipping TYPE_ACCESSIBILITY_OVERLAY window");
+                    }
+                    continue;
+                }
+                
+                // 记录应用程序窗口
+                if (type == AccessibilityWindowInfo.TYPE_APPLICATION) {
+                    appWindow = window;
+                    // 如果是活动窗口，优先使用
+                    if (window.isActive()) {
+                        if (Config.DEBUG_MODE) {
+                            Log.d(TAG, "Found active TYPE_APPLICATION window");
+                        }
+                        return window.getRoot();
+                    }
+                }
+                
+                // 记录活动窗口（备用）
+                if (window.isActive()) {
+                    activeWindow = window;
+                }
+            }
+            
+            // 返回找到的应用程序窗口，或活动窗口，或默认根节点
+            if (appWindow != null) {
+                if (Config.DEBUG_MODE) {
+                    Log.d(TAG, "Using TYPE_APPLICATION window");
+                }
+                return appWindow.getRoot();
+            }
+            
+            if (activeWindow != null) {
+                if (Config.DEBUG_MODE) {
+                    Log.d(TAG, "Using active window");
+                }
+                return activeWindow.getRoot();
+            }
+            
+        } catch (Exception e) {
+            Log.w(TAG, "Failed to get application window", e);
+        }
+        
+        // 兜底：返回默认根节点
+        return service.getRootInActiveWindow();
+    }
+    
+    /**
      * 递归遍历节点树
      */
     private void traverseNode(

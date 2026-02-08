@@ -16,12 +16,21 @@ export class SessionManager {
   private activeSessions: Map<string, SessionContext> = new Map(); // 活跃会话缓存
   private userSessions: Map<string, string> = new Map(); // user_id -> session_id 映射
   private cleanupInterval: NodeJS.Timeout | null = null;
+  private aiFailureCounts: Map<string, number> = new Map(); // session_id -> 连续失败次数
 
   constructor() {
     // 启动定时清理任务
     this.cleanupInterval = setInterval(() => {
       this.cleanupExpiredSessions();
     }, 60 * 1000); // 每分钟清理一次
+    
+    // v3.13: 启动数据库过期数据清理（每天一次）
+    setInterval(() => {
+      this.cleanupDatabase();
+    }, 24 * 60 * 60 * 1000); // 每天清理一次
+    
+    // v3.13: AI 失败计数器（用于连续失败检测）
+    this.aiFailureCounts = new Map();
   }
 
   /**
@@ -288,6 +297,88 @@ export class SessionManager {
   }
 
   /**
+   * v3.14: 处理设备断开连接
+   * 标记会话为等待重连状态，启动断连宽限期计时
+   */
+  handleDeviceDisconnect(userId: string): SessionContext | undefined {
+    const sessionId = this.userSessions.get(userId);
+    if (!sessionId) return undefined;
+
+    const session = this.activeSessions.get(sessionId);
+    if (!session) return undefined;
+
+    // 只处理 running 或 paused 状态的任务
+    if (session.status !== 'running' && session.status !== 'paused') {
+      return undefined;
+    }
+
+    // 标记设备断开状态
+    session.deviceDisconnectedAt = Date.now();
+    session.isWaitingReconnect = true;
+    session.device_ws = undefined; // 清除 WebSocket 连接
+
+    logger.info('Device disconnected, waiting for reconnect', {
+      session_id: sessionId,
+      user_id: userId,
+      grace_period: config.disconnectGrace,
+      current_status: session.status
+    });
+
+    return session;
+  }
+
+  /**
+   * v3.14: 处理设备重连
+   * 检查是否在宽限期内，如果是则恢复任务
+   */
+  handleDeviceReconnect(userId: string, ws: WebSocket): SessionContext | undefined {
+    const sessionId = this.userSessions.get(userId);
+    if (!sessionId) return undefined;
+
+    const session = this.activeSessions.get(sessionId);
+    if (!session) return undefined;
+
+    // 检查是否在等待重连状态
+    if (!session.isWaitingReconnect) {
+      // 不在等待重连，只是更新 WebSocket 连接
+      session.device_ws = ws;
+      return session;
+    }
+
+    // 检查是否在宽限期内
+    const now = Date.now();
+    const disconnectDuration = session.deviceDisconnectedAt 
+      ? now - session.deviceDisconnectedAt 
+      : Infinity;
+
+    if (disconnectDuration <= config.disconnectGrace) {
+      // 在宽限期内，恢复任务
+      session.device_ws = ws;
+      session.isWaitingReconnect = false;
+      session.deviceDisconnectedAt = undefined;
+      session.updated_at = now;
+
+      logger.info('Device reconnected within grace period, resuming task', {
+        session_id: sessionId,
+        user_id: userId,
+        disconnect_duration: disconnectDuration,
+        current_status: session.status
+      });
+
+      return session;
+    } else {
+      // 超过宽限期，不恢复
+      logger.warn('Device reconnected after grace period', {
+        session_id: sessionId,
+        user_id: userId,
+        disconnect_duration: disconnectDuration,
+        grace_period: config.disconnectGrace
+      });
+      return undefined;
+    }
+  }
+
+  /**
    * 更新任务指标（实际Token成本）
    */
   updateMetrics(
@@ -394,11 +485,28 @@ export class SessionManager {
   /**
    * 清理过期会话
    * v3.12: 移除 pending 状态相关的超时处理
+   * v3.14: 添加断连宽限期处理
    */
   private cleanupExpiredSessions(): void {
     const now = Date.now();
 
     for (const [sessionId, session] of this.activeSessions) {
+      // v3.14: 检查断连宽限期
+      if (session.isWaitingReconnect && session.deviceDisconnectedAt) {
+        const disconnectDuration = now - session.deviceDisconnectedAt;
+        if (disconnectDuration > config.disconnectGrace) {
+          // 超过宽限期，标记任务失败
+          logger.info('Disconnect grace period expired, ending session', {
+            session_id: sessionId,
+            disconnect_duration: disconnectDuration,
+            grace_period: config.disconnectGrace
+          });
+          this.endSession(sessionId, 'failed', '设备断开超过30秒，任务已取消');
+        }
+        // 如果在宽限期内，继续等待，不处理超时
+        continue;
+      }
+
       // 计算超时时间 - 从最后一次UI事件起算
       const lastActivity = session.last_ui_event?.timestamp || session.updated_at;
       const isExpired = now - lastActivity > config.taskTimeout;
@@ -415,6 +523,52 @@ export class SessionManager {
   }
 
   /**
+   * v3.13: 清理数据库过期数据
+   */
+  private async cleanupDatabase(): Promise<void> {
+    try {
+      const deletedCount = await dbManager.cleanupExpiredSessions(30);
+      if (deletedCount > 0) {
+        logger.info('Database cleanup completed', { deleted_sessions: deletedCount });
+      }
+    } catch (error) {
+      logger.error('Database cleanup failed', error);
+    }
+  }
+
+  /**
+   * v3.13: 记录 AI 调用失败
+   * 返回是否应该暂停任务（连续3次失败）
+   */
+  recordAiFailure(sessionId: string): boolean {
+    const currentCount = this.aiFailureCounts.get(sessionId) || 0;
+    const newCount = currentCount + 1;
+    this.aiFailureCounts.set(sessionId, newCount);
+    
+    logger.warn('AI API failure recorded', { 
+      session_id: sessionId, 
+      consecutive_failures: newCount 
+    });
+    
+    // 连续3次失败，应该暂停任务
+    if (newCount >= 3) {
+      logger.error('AI API consecutive failures reached threshold, pausing task', {
+        session_id: sessionId,
+        failure_count: newCount
+      });
+      return true;
+    }
+    return false;
+  }
+
+  /**
+   * v3.13: 重置 AI 失败计数
+   */
+  resetAiFailureCount(sessionId: string): void {
+    this.aiFailureCounts.delete(sessionId);
+  }
+
+  /**
    * 销毁管理器
    */
   destroy(): void {
@@ -423,6 +577,7 @@ export class SessionManager {
     }
     this.activeSessions.clear();
     this.userSessions.clear();
+    this.aiFailureCounts.clear();
   }
 
   /**

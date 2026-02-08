@@ -2,6 +2,7 @@ import { UiEventMessage, AiDecision, ActionCommandMessage, SessionContext } from
 import { config } from './config';
 import { logger } from './logger';
 import { UiFormatter } from './formatter';
+import { sessionManager } from './session-manager';
 
 /**
  * AI Core - 调用LLM进行决策
@@ -289,8 +290,9 @@ ${historyText}`;
         session.session_id
       );
       
-      // 成功时重置重试计数
+      // 成功时重置重试计数和AI失败计数
       this.resetRetryCount(session.session_id);
+      sessionManager.resetAiFailureCount(session.session_id);  // v3.13
       
       logger.debug('AI decision', { 
         session_id: session.session_id,
@@ -424,6 +426,7 @@ ${historyText}`;
         headers: {
           'Content-Type': 'application/json',
           'Authorization': `Bearer ${apiKey}`,
+          'User-Agent': 'KimiCLI/0.77',
         },
         body: JSON.stringify(requestBody),
       });

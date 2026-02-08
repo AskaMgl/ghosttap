@@ -4,15 +4,9 @@ buildscript {
         google()
         mavenCentral()
     }
-    
     dependencies {
-        classpath 'com.android.tools.build:gradle:8.1.0'
+        classpath 'com.android.tools.build:gradle:8.2.0'
     }
 }
 
-allprojects {
-    repositories {
-        google()
-        mavenCentral()
-    }
-}
+// 注意：项目依赖的仓库配置在 settings.gradle 的 dependencyResolutionManagement 中统一定义

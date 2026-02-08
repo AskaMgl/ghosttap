@@ -30,10 +30,12 @@ AI 驱动的 Android 远程控制。让 AI 成为你的手机替身。
 ### 3. 连接服务端
 
 打开 GhostTap App：
-1. 填入 user_id
+1. 填入 user_id 和服务器地址
 2. 开启无障碍权限
 3. 开启悬浮窗权限
 4. 点击"启动服务"
+
+> 通知栏显示"GhostTap 运行中"，可点击"停止服务"按钮快速停止
 
 ### 4. 开始自动化
 
@@ -72,32 +74,122 @@ AI 驱动的 Android 远程控制。让 AI 成为你的手机替身。
 ```
 ghosttap/
 ├── apps/
-│   ├── android/     # Android 客户端
-│   └── server/      # Node.js 服务端
-└── packages/
-    └── protocol/    # 通信协议定义
+│   ├── android/          # Android 客户端 (Java)
+│   │   ├── MainActivity.java          # 主界面 (清爽设计)
+│   │   ├── GhostTapService.java       # 无障碍服务核心
+│   │   ├── WebSocketManager.java      # WebSocket 连接管理
+│   │   ├── AccessibilityCollector.java# UI 采集器
+│   │   ├── CommandExecutor.java       # 指令执行器
+│   │   ├── FloatWindowManager.java    # 悬浮窗管理
+│   │   └── Config.java                # 配置文件
+│   └── server/           # Node.js 服务端
+│       ├── index.ts                  # 入口文件
+│       ├── websocket-gateway.ts      # WebSocket 网关
+│       ├── ai-core.ts                # AI 决策核心
+│       ├── session-manager.ts        # 会话管理
+│       ├── formatter.ts              # UI 格式化
+│       └── database.ts               # SQLite 数据库
+├── packages/
+│   └── protocol/         # 共享协议定义
+└── openclaw-skill/       # OpenClaw 技能插件
 ```
 
-## 🔧 自部署
+## 🔧 开发环境
+
+### 服务端
 
 ```bash
 # 克隆仓库
 git clone https://github.com/ghosttap/ghosttap.git
 cd ghosttap
 
-# 启动服务端
-cd apps/server
-npm install
-npm run dev
+# 安装依赖
+npm run install:all
 
-# 编译 Android App
-cd ../android
-./gradlew assembleDebug
+# 配置环境变量
+cp apps/server/.env.example apps/server/.env
+# 编辑 .env 文件，填入 AI API Key
+
+# 启动服务端（开发模式）
+npm run dev:server
 ```
+
+### Android 客户端
+
+```bash
+cd apps/android
+
+# 编译 Debug APK
+./gradlew assembleDebug
+
+# 安装到设备
+adb install app/build/outputs/apk/debug/app-debug.apk
+```
+
+### Docker 部署
+
+```bash
+# 使用 docker-compose
+docker-compose up -d
+
+# 或使用 Dockerfile
+docker build -t ghosttap-server .
+docker run -p 8080:8080 -p 8081:8081 ghosttap-server
+```
+
+## ⚙️ 配置说明
+
+### 服务端环境变量 (.env)
+
+| 配置项 | 说明 | 默认值 |
+|--------|------|--------|
+| `PORT` | WebSocket 端口 | 8080 |
+| `AI_API_KEY` | AI 服务 API Key | 必填 |
+| `AI_MODEL` | AI 模型 | kimi-coding/k2p5 |
+| `AI_API_URL` | AI 服务地址 | https://api.moonshot.cn/v1/chat/completions |
+| `WS_HEARTBEAT_INTERVAL` | 心跳间隔 | 90000 (90秒) |
+| `MAX_STEPS` | 单任务最大步数 | 50 |
+| `TASK_TIMEOUT` | 任务超时时间 | 1800000 (30分钟) |
+| `PAUSE_TIMEOUT` | 暂停超时时间 | 300000 (5分钟) |
+| `DISCONNECT_GRACE` | 断连宽限期 | 30000 (30秒) |
+| `DB_PATH` | SQLite 路径 | ./data/ghosttap.db |
+
+### Android 配置
+
+首次启动时配置：
+- **服务器地址**: WebSocket 地址 (如 `wss://your-server.com/ws`)
+- **用户 ID**: 从 OpenClaw/Feishu 获取的 `user_xxx`
+- **设备名称**: 用于标识设备（可选）
+
+配置自动保存到 SharedPreferences。
+
+## 🛡️ 安全设计
+
+### 两层敏感操作检测
+
+1. **第一层（硬检测）** - 代码级别关键词匹配
+   - 支付、密码、指纹等关键词
+   - 零延迟、不可绕过
+
+2. **第二层（AI 软检测）** - AI 语义判断
+   - 识别变体表述和上下文
+   - 覆盖模糊场景
+
+### 其他安全措施
+
+- **单设备绑定** - 同一 user_id 只能有一个连接
+- **TLS 加密** - 所有通信使用 wss://
+- **数据不留存** - UI 数据仅用于实时决策
+- **百分比坐标** - 适配不同屏幕尺寸
 
 ## 🤝 贡献
 
 欢迎 PR 和 Issue！
+
+代码规范：
+- TypeScript: `strict: true` 严格模式
+- Java: 遵循 Java 17 语法，显式访问修饰符
+- 关键版本更新添加 `// v3.x:` 标记
 
 ## 📄 许可
 
@@ -105,4 +197,4 @@ MIT License - 详见 [LICENSE](LICENSE)
 
 ---
 
-**Disclaimer**: GhostTap 是一个自动化工具，请遵守各平台的服务条款。仅用于个人学习和自动化测试，不要用于违反平台规则的操作。
+**免责声明**: GhostTap 是一个自动化工具，请遵守各平台的服务条款。仅用于个人学习和自动化测试，不要用于违反平台规则的操作。

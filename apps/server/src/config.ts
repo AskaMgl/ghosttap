@@ -41,6 +41,9 @@ export interface ServerConfig {
   
   // Logging
   logLevel: 'debug' | 'info' | 'warn' | 'error';
+  
+  // Security - MVP 白名单
+  allowedUserIds: Set<string>; // 允许的 user_id 白名单
 }
 
 function getEnv(key: string, defaultValue?: string): string {
@@ -100,6 +103,11 @@ export const config: ServerConfig = {
   
   // Logging
   logLevel: (process.env.LOG_LEVEL as ServerConfig['logLevel']) || 'info',
+  
+  // Security - MVP 白名单（逗号分隔的 user_id 列表）
+  allowedUserIds: new Set(
+    (process.env.ALLOWED_USER_IDS || 'a399bea4dba7').split(',').map(id => id.trim()).filter(Boolean)
+  ),
 };
 
 // 配置验证
@@ -108,10 +116,15 @@ export function validateConfig(): void {
     throw new Error('AI_API_KEY is required');
   }
   
+  if (config.allowedUserIds.size === 0) {
+    throw new Error('ALLOWED_USER_IDS is required (comma-separated user IDs)');
+  }
+  
   console.log('[Config] Server config loaded:');
   console.log(`  - Port: ${config.port}`);
   console.log(`  - AI Model: ${config.aiModel}`);
   console.log(`  - AI Retry: ${config.aiRetryMaxAttempts} attempts`);
   console.log(`  - Heartbeat Interval: ${config.heartbeatInterval}ms (90s)`);
   console.log(`  - DB Path: ${config.dbPath}`);
+  console.log(`  - Allowed User IDs: ${Array.from(config.allowedUserIds).join(', ')}`);
 }

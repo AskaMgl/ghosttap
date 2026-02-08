@@ -7,24 +7,27 @@ GhostTap Android 客户端 - AI 驱动的远程控制。
 ```
 android/
 ├── app/
-│   ├── src/main/java/com/ghosttap/
-│   │   ├── MainActivity.kt           # 主界面
-│   │   ├── GhostTapService.kt        # 无障碍服务核心
-│   │   ├── WebSocketManager.kt       # WebSocket 连接管理
-│   │   ├── AccessibilityCollector.kt # UI 采集器
-│   │   ├── CommandExecutor.kt        # 指令执行器
-│   │   ├── FloatWindowManager.kt     # 悬浮窗管理
-│   │   └── Config.kt                 # 配置文件
+│   ├── src/main/java/com/aska/ghosttap/
+│   │   ├── MainActivity.java          # 主界面 (v3.14)
+│   │   ├── GhostTapService.java       # 无障碍服务核心 (v3.14)
+│   │   ├── WebSocketManager.java      # WebSocket 连接管理 (v3.12)
+│   │   ├── AccessibilityCollector.java # UI 采集器 (v3.12)
+│   │   ├── CommandExecutor.java       # 指令执行器 (v3.12)
+│   │   ├── FloatWindowManager.java    # 悬浮窗管理 (v3.12)
+│   │   ├── MessageModels.java         # 通信协议定义 (v3.12)
+│   │   ├── JsonUtils.java             # JSON 工具类
+│   │   └── Config.java                # 配置文件 (v3.13)
 │   ├── src/main/res/
 │   │   ├── layout/
-│   │   │   ├── activity_main.xml     # 主界面布局
-│   │   │   ├── float_status_bar.xml  # 状态栏悬浮窗
-│   │   │   ├── dialog_auth.xml       # 授权弹窗
-│   │   │   └── dialog_pause.xml      # 暂停弹窗
+│   │   │   ├── activity_main.xml      # 主界面布局
+│   │   │   ├── float_status_bar.xml   # 状态栏悬浮窗
+│   │   │   ├── dialog_auth.xml        # 授权弹窗
+│   │   │   └── dialog_pause.xml       # 暂停弹窗
 │   │   ├── xml/
 │   │   │   └── accessibility_service_config.xml  # 无障碍配置
 │   │   └── values/
-│   │       └── strings.xml
+│   │       ├── strings.xml
+│   │       └── themes.xml
 │   ├── build.gradle
 │   └── proguard-rules.pro
 ├── build.gradle
@@ -38,13 +41,14 @@ android/
 
 ### 1. 配置服务端地址
 
-编辑 `app/src/main/java/com/ghosttap/Config.kt`：
+编辑 `app/src/main/java/com/aska/ghosttap/Config.java`：
 
-```kotlin
-object Config {
-    const val SERVER_URL = "wss://your-server.com/ws"
-    const val API_BASE_URL = "https://your-server.com"
-    ...
+```java
+public class Config {
+    // WebSocket 服务器地址
+    public static final String SERVER_URL = "wss://your-server.com/ws";
+    
+    // 其他配置...
 }
 ```
 
@@ -75,13 +79,16 @@ adb install app/build/outputs/apk/debug/app-debug.apk
 
 ### 核心模块
 
-| 模块 | 职责 |
-|------|------|
-| **GhostTapService** | 无障碍服务，监听界面变化，协调各模块 |
-| **WebSocketManager** | 管理 WebSocket 连接、心跳、重连 |
-| **AccessibilityCollector** | 采集 UI 树，预过滤元素，百分比坐标转换 |
-| **CommandExecutor** | 执行云端指令（点击、输入、滑动等） |
-| **FloatWindowManager** | 显示状态栏、授权弹窗、暂停控制 |
+| 模块 | 职责 | 版本 |
+|------|------|------|
+| **MainActivity** | 主界面，配置管理，权限检查 | v3.14 |
+| **GhostTapService** | 无障碍服务，监听界面变化，协调各模块 | v3.14 |
+| **WebSocketManager** | 管理 WebSocket 连接、心跳(90s)、重连 | v3.12 |
+| **AccessibilityCollector** | 采集 UI 树，预过滤元素，百分比坐标转换，软键盘检测 | v3.12 |
+| **CommandExecutor** | 执行云端指令（点击、输入、滑动、启动APP等） | v3.12 |
+| **FloatWindowManager** | 显示状态栏、授权弹窗、暂停控制 | v3.12 |
+| **MessageModels** | 定义客户端-服务端通信协议 | v3.12 |
+| **Config** | 集中管理配置项 | v3.13 |
 
 ### 数据流
 
@@ -104,46 +111,126 @@ WebSocketManager 上报云端
 云端 AI 决策
     │
     ▼
-下发 action 指令
+ActionCommand 下发
     │
     ▼
 CommandExecutor 执行
 ```
 
+## 📡 通信协议
+
+### 上行消息（手机 → 云端）
+
+| 消息类型 | 说明 | 版本 |
+|----------|------|------|
+| `ui_event` | UI 变化事件上报 | - |
+| `ping` | 心跳保活（90秒间隔） | v3.12 |
+| `pause` | 用户暂停任务 | v3.12 |
+| `resume` | 用户恢复任务 | v3.12 |
+| `stop` | 用户停止任务 | v3.12 |
+| `error` | 动作执行失败上报 | v3.12 |
+
+### 下行消息（云端 → 手机）
+
+| 消息类型 | 说明 | 版本 |
+|----------|------|------|
+| `pong` | 心跳响应 | v3.12 |
+| `task_start` | 任务开始（直接开始，无需授权） | v3.12 |
+| `task_resume` | 断连重连后恢复任务 | v3.12 |
+| `action` | 动作指令（点击、输入、滑动等） | v3.12 |
+| `task_end` | 任务结束 | v3.12 |
+
+### 支持的动作指令
+
+| 动作 | 说明 | 参数 |
+|------|------|------|
+| `click` | 点击指定坐标 | `target.center` [x%, y%] |
+| `input` | 输入文本（三层防线） | `target.center`, `text` |
+| `swipe` | 滑动操作 | `direction`, `distance`, `duration_ms` |
+| `back` | 返回键 | - |
+| `home` | Home键 | - |
+| `launch_app` | 启动应用 | `package_name` |
+| `wait` | 等待 | `wait_ms` |
+| `pause` | 暂停任务 | `reason` |
+
 ## ⚙️ 配置说明
 
-### Config.kt 配置项
+### Config.java 主要配置项
 
-| 配置项 | 默认值 | 说明 |
-|--------|--------|------|
-| `SERVER_URL` | - | WebSocket 服务器地址 |
-| `HEARTBEAT_INTERVAL` | 3分钟 | 心跳间隔 |
-| `UI_EVENT_DEBOUNCE` | 300ms | UI 上报防抖时间 |
-| `MAX_UI_ELEMENTS` | 50 | 最大 UI 元素数量 |
-| `AUTH_TIMEOUT` | 60秒 | 授权超时时间 |
+```java
+public class Config {
+    // 服务端配置
+    public static final String SERVER_URL = "wss://your-server.com/ws";
+    
+    // 心跳间隔（毫秒）- v3.12: 90秒
+    public static final long HEARTBEAT_INTERVAL = 90 * 1000L;
+    
+    // UI 事件防抖时间（毫秒）- v3.12: 300ms
+    public static final long UI_EVENT_DEBOUNCE = 300L;
+    
+    // 最大 UI 元素数量 - v3.12: 50个
+    public static final int MAX_UI_ELEMENTS = 50;
+    
+    // 调试模式
+    public static boolean DEBUG_MODE = false;
+}
+```
 
-## 🔒 安全设计
+## � 技术栈
 
-- **敏感操作自动暂停**：检测到支付、密码等关键词时自动暂停
-- **用户授权**：每次任务都需要用户在手机上确认
-- **单设备绑定**：同一 user_id 只能有一个设备连接
-- **TLS 加密**：所有通信使用 wss://
+- **语言**: Java
+- **最低 SDK**: 24 (Android 7.0)
+- **目标 SDK**: 34 (Android 14)
+- **Java 版本**: 17
+- **主要依赖**:
+  - OkHttp 4.12.0 - WebSocket 通信
+  - Gson 2.10.1 - JSON 序列化
+  - AndroidX Core 1.12.0
 
-## 📋 依赖
+## � 权限说明
 
-- **Kotlin**: 1.9.0
-- **OkHttp**: 4.12.0 (WebSocket 客户端)
-- **Kotlinx Serialization**: 1.6.0 (JSON 序列化)
-- **minSdk**: 26 (Android 8.0)
+```xml
+<!-- 网络权限 -->
+<uses-permission android:name="android.permission.INTERNET" />
+<uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
 
-## 📄 协议文档
+<!-- 悬浮窗权限 -->
+<uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW" />
+<uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+<uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC" />
+```
 
-详见 [docs/protocol.md](../../docs/protocol.md) 和 [docs/android-client-design.md](../../docs/android-client-design.md)
+## 🔄 版本历史
 
-## 🤝 贡献
+### v3.14 (当前)
+- 优化主界面设计，清爽风格
+- 添加通知栏停止按钮
+- 完善状态显示
 
-欢迎 PR 和 Issue！
+### v3.13
+- 支持设备名称持久化
+- 优化配置管理
 
-## 📄 许可
+### v3.12
+- 移除授权流程，任务直接开始
+- 新增软键盘检测
+- 90秒心跳间隔
+- 新增 pause/resume/stop 用户控制
+- 三层防线输入策略
+- 支持 launch_app 和 wait 动作
+
+## 🐛 调试
+
+开启详细日志：
+```java
+Config.DEBUG_MODE = true;
+```
+
+查看日志：
+```bash
+adb logcat -s GhostTap:D
+```
+
+## 📄 许可证
 
 MIT License

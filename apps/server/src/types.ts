@@ -172,6 +172,9 @@ export interface SessionContext {
   history: ActionRecord[];
   metrics: TaskMetrics;
   result?: string;
+  // v3.14: 断连宽限期相关
+  deviceDisconnectedAt?: number;  // 设备断开连接的时间戳
+  isWaitingReconnect?: boolean;   // 是否在等待设备重连
 }
 
 // ============ OpenClaw Skill 回调消息类型 ============
@@ -242,4 +245,14 @@ export interface DbDeviceBinding {
   device_name?: string;
   connected_at: number;
   last_ping: number;
+}
+
+// ============ WebSocket 客户端信息 ============
+
+export interface ClientInfo {
+  ws: any;  // WebSocket instance from 'ws' library
+  user_id: string;
+  device_name: string;
+  lastPing: number;
+  isAuthenticated: boolean;
 }

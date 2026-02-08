@@ -10,10 +10,18 @@ services:
     environment:
       - PORT=8080
       - HOST=0.0.0.0
-      - AI_MODEL=${AI_MODEL:-kimi-coding/k2p5}
+      - AI_MODEL=kimi-coding/k2p5
       - AI_API_KEY=${AI_API_KEY}
-      - AI_API_URL=${AI_API_URL:-https://api.moonshot.cn/v1/chat/completions}
+      - AI_API_URL=https://api.kimi.com/coding/v1/chat/completions
       - LOG_LEVEL=${LOG_LEVEL:-info}
+      - ALLOWED_USER_IDS=${ALLOWED_USER_IDS:-a399bea4dba7}
+      - WS_HEARTBEAT_INTERVAL=${WS_HEARTBEAT_INTERVAL:-90000}
+      - WS_HEARTBEAT_TIMEOUT=${WS_HEARTBEAT_TIMEOUT:-180000}
+      - TASK_TIMEOUT=${TASK_TIMEOUT:-1800000}
+      - MAX_STEPS=${MAX_STEPS:-50}
+      - DB_PATH=/app/data/ghosttap.db
+    volumes:
+      - ./data:/app/data  # 数据库持久化
     restart: unless-stopped
     healthcheck:
       test: ["CMD", "wget", "-q", "--spider", "http://localhost:8081/health"]
